@@ -5,20 +5,22 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
 import optuna
 from dataset import LOBDataset, generate_date_urls
-from model import OrderBookTransformer
+from model import CombinedModel, TOTAL_INPUT_DIM
 from config import (
-    TRAIN_NUM_EPOCHS, TRAIN_BATCH_SIZE, TRAINING_DATE_RANGE, SEQUENCE_LENGTH,
+    TRAIN_NUM_EPOCHS, TRAIN_BATCH_SIZE, TRAINING_DATE_RANGES, SEQUENCE_LENGTH,
     HORIZON_MS, NUM_LEVELS, PENALTY_FACTOR, MIN_SIGNAL_PERCENT, URL_TEMPLATE
 )
 import numpy as np
 from tqdm import tqdm
 
-# Генерируем список URL на основе диапазона дат
-TRAINING_DATA_URLS = ",".join(generate_date_urls(TRAINING_DATE_RANGE, URL_TEMPLATE))
+# Объединяем данные из диапазонов
+TRAINING_DATA_URLS = []
+for dr in TRAINING_DATE_RANGES:
+    TRAINING_DATA_URLS.extend(generate_date_urls(dr, URL_TEMPLATE))
+TRAINING_DATA_URLS = ",".join(TRAINING_DATA_URLS)
 
 def custom_loss(predictions, targets, min_signal_percent=MIN_SIGNAL_PERCENT, penalty_factor=PENALTY_FACTOR):
     mse = (predictions - targets) ** 2
-    # Штрафуем, если предсказание указывает на торговый сигнал, но целевое изменение имеет противоположный знак
     long_mask = predictions > min_signal_percent
     long_penalty = torch.where(long_mask & (targets < 0), (-targets) ** 2, torch.zeros_like(targets))
     short_mask = predictions < -min_signal_percent
@@ -43,9 +45,8 @@ def objective(trial):
     train_loader = DataLoader(train_dataset, batch_size=TRAIN_BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=TRAIN_BATCH_SIZE, shuffle=False)
     
-    input_dim = NUM_LEVELS * 4
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = OrderBookTransformer(input_dim=input_dim, model_dim=model_dim, num_layers=num_layers, nhead=nhead, dropout=dropout)
+    model = CombinedModel(input_dim=TOTAL_INPUT_DIM, model_dim=model_dim, num_layers=num_layers, nhead=nhead, dropout=dropout)
     model.to(device)
     
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
@@ -56,27 +57,27 @@ def objective(trial):
         model.train()
         train_loss = 0.0
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}", leave=False)
-        for sequences, targets in pbar:
-            sequences = sequences.to(device)
+        for features, targets in pbar:
+            features = features.to(device)
             targets = targets.to(device)
             optimizer.zero_grad()
-            outputs = model(sequences)
+            outputs = model(features)
             loss = custom_loss(outputs, targets, min_signal_percent=MIN_SIGNAL_PERCENT, penalty_factor=PENALTY_FACTOR)
             loss.backward()
             optimizer.step()
-            train_loss += loss.item() * sequences.size(0)
+            train_loss += loss.item() * features.size(0)
             pbar.set_postfix(loss=loss.item())
         train_loss /= len(train_dataset)
         
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
-            for sequences, targets in val_loader:
-                sequences = sequences.to(device)
+            for features, targets in val_loader:
+                features = features.to(device)
                 targets = targets.to(device)
-                outputs = model(sequences)
+                outputs = model(features)
                 loss = custom_loss(outputs, targets, min_signal_percent=MIN_SIGNAL_PERCENT, penalty_factor=PENALTY_FACTOR)
-                val_loss += loss.item() * sequences.size(0)
+                val_loss += loss.item() * features.size(0)
         val_loss /= len(val_dataset)
         pbar_epoch.set_postfix(val_loss=val_loss)
         trial.report(val_loss, epoch)
@@ -92,44 +93,40 @@ if __name__ == '__main__':
     print("Best trial:")
     trial = study.best_trial
     print(f"  Value: {trial.value}")
-    print("  Params:")
     for key, value in trial.params.items():
         print(f"    {key}: {value}")
     
     best_params = trial.params
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    input_dim = NUM_LEVELS * 4
-    final_model = OrderBookTransformer(
-        input_dim=input_dim,
-        model_dim=best_params["model_dim"],
-        num_layers=best_params["num_layers"],
-        nhead=best_params["nhead"],
-        dropout=best_params["dropout"]
-    )
-    final_model.to(device)
-    optimizer = optim.Adam(final_model.parameters(), lr=best_params["learning_rate"])
+    model = CombinedModel(input_dim=TOTAL_INPUT_DIM,
+                          model_dim=best_params["model_dim"],
+                          num_layers=best_params["num_layers"],
+                          nhead=best_params["nhead"],
+                          dropout=best_params["dropout"])
+    model.to(device)
+    optimizer = optim.Adam(model.parameters(), lr=best_params["learning_rate"])
     
     dataset = LOBDataset(TRAINING_DATA_URLS, sequence_length=SEQUENCE_LENGTH, horizon_ms=HORIZON_MS, num_levels=NUM_LEVELS)
     train_loader = DataLoader(dataset, batch_size=TRAIN_BATCH_SIZE, shuffle=True)
     
     pbar_epoch = tqdm(range(TRAIN_NUM_EPOCHS), desc="Final Model Epochs")
     for epoch in pbar_epoch:
-        final_model.train()
+        model.train()
         epoch_loss = 0.0
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}", leave=False)
-        for sequences, targets in pbar:
-            sequences = sequences.to(device)
+        for features, targets in pbar:
+            features = features.to(device)
             targets = targets.to(device)
             optimizer.zero_grad()
-            outputs = final_model(sequences)
+            outputs = model(features)
             loss = custom_loss(outputs, targets, min_signal_percent=MIN_SIGNAL_PERCENT, penalty_factor=PENALTY_FACTOR)
             loss.backward()
             optimizer.step()
-            epoch_loss += loss.item() * sequences.size(0)
+            epoch_loss += loss.item() * features.size(0)
             pbar.set_postfix(loss=loss.item())
         epoch_loss /= len(dataset)
         pbar_epoch.set_postfix(epoch_loss=epoch_loss)
         print(f"Final Model Epoch {epoch+1}/{TRAIN_NUM_EPOCHS}, Loss: {epoch_loss:.6f}")
     
-    torch.save(final_model.state_dict(), "final_model.pth")
+    torch.save(model.state_dict(), "final_model.pth")
     print("Final model saved as final_model.pth")

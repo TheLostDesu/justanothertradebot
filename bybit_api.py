@@ -4,11 +4,10 @@ import hmac
 import hashlib
 import aiohttp
 import json
-from config import API_KEY, API_SECRET, REST_API_BASE, ORDER_CREATE_ENDPOINT, BALANCE_ENDPOINT
+from config import API_KEY, API_SECRET, REST_API_BASE, ORDER_CREATE_ENDPOINT, BALANCE_ENDPOINT, KLINE_ENDPOINT
 
 def sign_request(method, endpoint, params, secret):
     timestamp = str(int(time.time() * 1000))
-    # Сортируем параметры и формируем строку для подписи (проверьте согласно документации Bybit v5)
     sorted_params = "&".join(f"{k}={params[k]}" for k in sorted(params))
     sign_str = f"{timestamp}{method.upper()}{endpoint}{sorted_params}"
     signature = hmac.new(secret.encode('utf-8'), sign_str.encode('utf-8'), hashlib.sha256).hexdigest()
@@ -50,4 +49,22 @@ async def create_order(session, symbol, side, qty, leverage, stop_loss, take_pro
         "Content-Type": "application/json"
     }
     async with session.post(url, headers=headers, json=params) as response:
+        return await response.json()
+
+async def fetch_candles(session, symbol, interval="5", limit=60):
+    endpoint = KLINE_ENDPOINT
+    url = REST_API_BASE + endpoint
+    params = {
+        "category": "linear",
+        "symbol": symbol.replace("/", ""),
+        "interval": interval,
+        "limit": limit
+    }
+    timestamp, signature = sign_request("GET", endpoint, params, API_SECRET)
+    headers = {
+        "X-BAPI-API-KEY": API_KEY,
+        "X-BAPI-TIMESTAMP": timestamp,
+        "X-BAPI-SIGN": signature
+    }
+    async with session.get(url, headers=headers, params=params) as response:
         return await response.json()

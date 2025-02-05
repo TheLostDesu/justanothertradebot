@@ -2,7 +2,7 @@
 import torch
 import torch.nn as nn
 import math
-from config import MODEL_DIM, DROPOUT, NUM_LAYERS, NHEAD
+from config import MODEL_DIM, DROPOUT, NUM_LAYERS, NHEAD, TOTAL_INPUT_DIM
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, dropout=DROPOUT, max_len=5000):
@@ -15,26 +15,22 @@ class PositionalEncoding(nn.Module):
         pe[:, 1::2] = torch.cos(position * div_term)
         pe = pe.unsqueeze(0)  # (1, max_len, d_model)
         self.register_buffer('pe', pe)
-
     def forward(self, x):
         x = x + self.pe[:, :x.size(1)]
         return self.dropout(x)
 
-class OrderBookTransformer(nn.Module):
-    def __init__(self, input_dim, model_dim=MODEL_DIM, num_layers=NUM_LAYERS, nhead=NHEAD, dropout=DROPOUT):
-        """
-        input_dim: размер входного вектора (например, NUM_LEVELS*4)
-        Выдает предсказание в виде процентного изменения mid‑price.
-        """
-        super(OrderBookTransformer, self).__init__()
+class CombinedModel(nn.Module):
+    def __init__(self, input_dim=TOTAL_INPUT_DIM, model_dim=MODEL_DIM, num_layers=NUM_LAYERS, nhead=NHEAD, dropout=DROPOUT):
+        super(CombinedModel, self).__init__()
         self.embedding = nn.Linear(input_dim, model_dim)
         self.pos_encoder = PositionalEncoding(model_dim, dropout)
         encoder_layers = nn.TransformerEncoderLayer(d_model=model_dim, nhead=nhead, dropout=dropout)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers=num_layers)
         self.fc_out = nn.Linear(model_dim, 1)
-
     def forward(self, x):
         x = self.embedding(x)
+        # Добавляем временную размерность (1, batch_size, model_dim)
+        x = x.unsqueeze(1)
         x = self.pos_encoder(x)
         x = x.transpose(0, 1)
         x = self.transformer_encoder(x)
