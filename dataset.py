@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from config import SEQUENCE_LENGTH, HORIZON_MS, NUM_LEVELS, TRAINING_DATE_RANGES, URL_TEMPLATE, MAX_TARGET_CHANGE_PERCENT, CANDLE_INTERVAL_MIN, CANDLE_TOTAL_HOURS, CANDLE_FEATURES_PER_CANDLE
 
 def generate_date_urls(date_range, template):
+    # Ожидаем, что date_range – это строка вида "YYYY-MM-DD,YYYY-MM-DD"
     start_str, end_str = date_range.split(',')
     start_date = datetime.strptime(start_str.strip(), "%Y-%m-%d")
     end_date = datetime.strptime(end_str.strip(), "%Y-%m-%d")
@@ -94,13 +95,13 @@ class LOBDataset(Dataset):
         self.num_levels = num_levels
         self.samples = []
         self.records = []
-        all_urls = []
-        if isinstance(zip_sources, list):
+        # Если zip_sources передан как список URL, используем его напрямую; иначе, обрабатываем как диапазоны
+        if isinstance(zip_sources, list) and zip_sources and isinstance(zip_sources[0], str) and zip_sources[0].startswith("http"):
+            all_urls = zip_sources
+        else:
+            all_urls = []
             for dr in zip_sources:
                 all_urls.extend(generate_date_urls(dr, URL_TEMPLATE))
-        else:
-            all_urls = generate_date_urls(zip_sources, URL_TEMPLATE)
-        current_ob = None
         for src in all_urls:
             zf = open_zip(src)
             if zf is None:
@@ -133,8 +134,9 @@ class LOBDataset(Dataset):
                                     except Exception:
                                         continue
                         elif r_type == 'delta':
-                            if current_ob is None:
+                            if not self.records:
                                 continue
+                            # Используем предыдущее состояние current_ob, обновляя его с учетом delta
                             for side in ['a', 'b']:
                                 if side in data:
                                     for update in data[side]:

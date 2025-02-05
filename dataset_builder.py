@@ -1,9 +1,9 @@
 # dataset_builder.py
 import pickle
-from dataset import LOBDataset, generate_date_urls
+from dataset import LOBDataset
 from config import TRAINING_DATE_RANGES, URL_TEMPLATE, NUM_LEVELS, SEQUENCE_LENGTH, HORIZON_MS, SYMBOLS
 import numpy as np
-from tqdm import tqdm  # Импортируем tqdm для прогресс-бара
+from tqdm import tqdm
 
 def build_dataset():
     all_urls = []
@@ -11,18 +11,21 @@ def build_dataset():
     for dr in TRAINING_DATE_RANGES:
         for sym in SYMBOLS:
             pair = sym.replace("/", "")
-            # Подставляем пару в шаблон URL
+            urls = []  # Получаем URL по диапазону дат для данной пары
+            # Используем generate_date_urls напрямую
+            # Здесь предполагается, что dr имеет формат "YYYY-MM-DD,YYYY-MM-DD"
+            # И подставляем пару в шаблон
+            from dataset import generate_date_urls  # Импортируем здесь, чтобы использовать функцию
             urls = generate_date_urls(dr, URL_TEMPLATE.replace("{pair}", pair))
             all_urls.extend(urls)
     print(f"Total archives to process: {len(all_urls)}")
-    # Преобразуем итератор tqdm в список, чтобы передать его в конструктор датасета
-    dataset = LOBDataset(list(tqdm(all_urls, desc="Processing archives")), 
+    # Передаём список URL напрямую в LOBDataset
+    dataset = LOBDataset(list(tqdm(all_urls, desc="Processing archives")),
                          sequence_length=SEQUENCE_LENGTH, 
                          horizon_ms=HORIZON_MS, 
                          num_levels=NUM_LEVELS)
     features = []
     targets = []
-    # Оборачиваем итерацию по датасету в tqdm, если набор данных большой
     for feat, target in tqdm(dataset, desc="Building dataset samples"):
         features.append(feat)
         targets.append(target)

@@ -1,3 +1,4 @@
+# bybit_api.py
 import time
 import hmac
 import hashlib
