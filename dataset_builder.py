@@ -11,19 +11,13 @@ def build_dataset():
     for dr in TRAINING_DATE_RANGES:
         for sym in SYMBOLS:
             pair = sym.replace("/", "")
-            urls = []  # Получаем URL по диапазону дат для данной пары
-            # Используем generate_date_urls напрямую
-            # Здесь предполагается, что dr имеет формат "YYYY-MM-DD,YYYY-MM-DD"
-            # И подставляем пару в шаблон
-            from dataset import generate_date_urls  # Импортируем здесь, чтобы использовать функцию
+            # Подставляем пару в шаблон URL
+            from dataset import generate_date_urls
             urls = generate_date_urls(dr, URL_TEMPLATE.replace("{pair}", pair))
             all_urls.extend(urls)
     print(f"Total archives to process: {len(all_urls)}")
-    # Передаём список URL напрямую в LOBDataset
-    dataset = LOBDataset(list(tqdm(all_urls, desc="Processing archives")),
-                         sequence_length=SEQUENCE_LENGTH, 
-                         horizon_ms=HORIZON_MS, 
-                         num_levels=NUM_LEVELS)
+    # Передаем список URL в LOBDataset (прогресс бар обновляется внутри класса)
+    dataset = LOBDataset(all_urls, sequence_length=SEQUENCE_LENGTH, horizon_ms=HORIZON_MS, num_levels=NUM_LEVELS)
     features = []
     targets = []
     for feat, target in tqdm(dataset, desc="Building dataset samples"):

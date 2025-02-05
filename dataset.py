@@ -8,9 +8,10 @@ import numpy as np
 from torch.utils.data import Dataset
 from datetime import datetime, timedelta
 from config import SEQUENCE_LENGTH, HORIZON_MS, NUM_LEVELS, TRAINING_DATE_RANGES, URL_TEMPLATE, MAX_TARGET_CHANGE_PERCENT, CANDLE_INTERVAL_MIN, CANDLE_TOTAL_HOURS, CANDLE_FEATURES_PER_CANDLE
+from tqdm import tqdm
 
 def generate_date_urls(date_range, template):
-    # Ожидаем, что date_range – это строка вида "YYYY-MM-DD,YYYY-MM-DD"
+    # Ожидаем строку вида "YYYY-MM-DD,YYYY-MM-DD"
     start_str, end_str = date_range.split(',')
     start_date = datetime.strptime(start_str.strip(), "%Y-%m-%d")
     end_date = datetime.strptime(end_str.strip(), "%Y-%m-%d")
@@ -95,14 +96,15 @@ class LOBDataset(Dataset):
         self.num_levels = num_levels
         self.samples = []
         self.records = []
-        # Если zip_sources передан как список URL, используем его напрямую; иначе, обрабатываем как диапазоны
+        # Если zip_sources – это список URL, используем его напрямую
         if isinstance(zip_sources, list) and zip_sources and isinstance(zip_sources[0], str) and zip_sources[0].startswith("http"):
             all_urls = zip_sources
         else:
             all_urls = []
             for dr in zip_sources:
                 all_urls.extend(generate_date_urls(dr, URL_TEMPLATE))
-        for src in all_urls:
+        # Используем tqdm внутри класса для отслеживания прогресса
+        for src in tqdm(all_urls, desc="Processing archives in LOBDataset"):
             zf = open_zip(src)
             if zf is None:
                 continue
@@ -136,7 +138,6 @@ class LOBDataset(Dataset):
                         elif r_type == 'delta':
                             if not self.records:
                                 continue
-                            # Используем предыдущее состояние current_ob, обновляя его с учетом delta
                             for side in ['a', 'b']:
                                 if side in data:
                                     for update in data[side]:

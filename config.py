@@ -12,7 +12,7 @@ TRAINING_DATE_RANGES = [
 URL_TEMPLATE = "https://quote-saver.bycsi.com/orderbook/linear/{pair}/{date}_{pair}_ob500.data.zip"
 
 # --- Trading pairs ---
-# Используем единый список пар для обучения и live‑трейдинга
+# Единый список пар для обучения и live‑трейдинга
 SYMBOLS = ["BTC/USDT", "ETH/USDT", "BNB/USDT", "ADA/USDT", "XRP/USDT",
            "SOL/USDT", "DOT/USDT", "DOGE/USDT", "LTC/USDT", "MATIC/USDT"]
 
