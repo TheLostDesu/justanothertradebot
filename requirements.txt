@@ -1,6 +1,7 @@
-torch>=1.9.0
-ccxt>=1.100.0
-tqdm>=4.62.3
-numpy>=1.19.5
-requests>=2.25.1
-optuna>=2.10.0
+aiohttp
+websockets
+optuna
+torch
+tqdm
+numpy
+requests

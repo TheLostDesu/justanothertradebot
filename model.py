@@ -17,14 +17,13 @@ class PositionalEncoding(nn.Module):
         self.register_buffer('pe', pe)
 
     def forward(self, x):
-        # x: (batch_size, seq_len, d_model)
         x = x + self.pe[:, :x.size(1)]
         return self.dropout(x)
 
 class OrderBookTransformer(nn.Module):
     def __init__(self, input_dim, model_dim=MODEL_DIM, num_layers=NUM_LAYERS, nhead=NHEAD, dropout=DROPOUT):
         """
-        input_dim: размер входного вектора (например, NUM_LEVELS * 4)
+        input_dim: размер входного вектора (например, NUM_LEVELS*4)
         Выдает предсказание в виде процентного изменения mid‑price.
         """
         super(OrderBookTransformer, self).__init__()
@@ -35,11 +34,10 @@ class OrderBookTransformer(nn.Module):
         self.fc_out = nn.Linear(model_dim, 1)
 
     def forward(self, x):
-        # x: (batch_size, seq_len, input_dim)
-        x = self.embedding(x)               # -> (batch_size, seq_len, model_dim)
-        x = self.pos_encoder(x)             # -> (batch_size, seq_len, model_dim)
-        x = x.transpose(0, 1)               # -> (seq_len, batch_size, model_dim)
-        x = self.transformer_encoder(x)     # -> (seq_len, batch_size, model_dim)
-        x = x[-1]                         # последний временной шаг (batch_size, model_dim)
-        out = self.fc_out(x)                # -> (batch_size, 1)
-        return out.squeeze(-1)              # -> (batch_size)
+        x = self.embedding(x)
+        x = self.pos_encoder(x)
+        x = x.transpose(0, 1)
+        x = self.transformer_encoder(x)
+        x = x[-1]
+        out = self.fc_out(x)
+        return out.squeeze(-1)

@@ -6,10 +6,22 @@ import os
 import requests
 import numpy as np
 from torch.utils.data import Dataset
-from config import SEQUENCE_LENGTH, HORIZON_MS, NUM_LEVELS
+from datetime import datetime, timedelta
+from config import SEQUENCE_LENGTH, HORIZON_MS, NUM_LEVELS, TRAINING_DATE_RANGE, URL_TEMPLATE, MAX_TARGET_CHANGE_PERCENT
+
+def generate_date_urls(date_range, template):
+    start_str, end_str = date_range.split(',')
+    start_date = datetime.strptime(start_str.strip(), "%Y-%m-%d")
+    end_date = datetime.strptime(end_str.strip(), "%Y-%m-%d")
+    urls = []
+    current_date = start_date
+    while current_date <= end_date:
+        date_str = current_date.strftime("%Y-%m-%d")
+        urls.append(template.format(date_str))
+        current_date += timedelta(days=1)
+    return urls
 
 def open_zip(zip_path_or_url):
-    """Открывает zip‑архив из URL или локального пути."""
     if zip_path_or_url.startswith("http"):
         try:
             r = requests.get(zip_path_or_url)
@@ -25,13 +37,6 @@ def open_zip(zip_path_or_url):
         return zipfile.ZipFile(zip_path_or_url, 'r')
 
 def get_features_from_orderbook(ob, num_levels=NUM_LEVELS):
-    """
-    Формирует вектор признаков из текущего состояния стакана.
-    Входной формат: ob = { 'a': {price: size, ...}, 'b': {price: size, ...} }
-    Сортировка: bids – по убыванию, asks – по возрастанию.
-    Если уровней меньше num_levels, дополняем нулями.
-    Возвращает список длины num_levels*4.
-    """
     features = []
     bids = sorted(ob['b'].items(), key=lambda x: x[0], reverse=True)
     for i in range(num_levels):
@@ -50,9 +55,6 @@ def get_features_from_orderbook(ob, num_levels=NUM_LEVELS):
     return features
 
 def get_mid_price(ob):
-    """
-    Вычисляет mid‑price как среднее между лучшим bid и лучшей ask.
-    """
     bids = sorted(ob['b'].items(), key=lambda x: x[0], reverse=True)
     asks = sorted(ob['a'].items(), key=lambda x: x[0])
     if not bids or not asks:
@@ -63,23 +65,18 @@ def get_mid_price(ob):
 
 class LOBDataset(Dataset):
     def __init__(self, zip_sources, sequence_length=SEQUENCE_LENGTH, horizon_ms=HORIZON_MS, num_levels=NUM_LEVELS):
-        """
-        Аргументы:
-          zip_sources: строка с URL/путями к zip‑архивам, разделёнными запятой, или список строк.
-          sequence_length: число последовательных snapshot'ов.
-          horizon_ms: горизонт для расчёта целевой дельты (будет переведён в процентное изменение).
-          num_levels: число уровней с каждой стороны стакана.
-        """
         self.sequence_length = sequence_length
         self.horizon_ms = horizon_ms
         self.num_levels = num_levels
         self.samples = []
-
         if isinstance(zip_sources, str):
-            zip_sources = [s.strip() for s in zip_sources.split(',')]
+            parts = zip_sources.split(',')
+            if len(parts) == 2 and "-" in parts[0]:
+                zip_sources = generate_date_urls(zip_sources, URL_TEMPLATE)
+            else:
+                zip_sources = [s.strip() for s in zip_sources.split(',')]
         records = []
         current_ob = None
-
         for src in zip_sources:
             zf = open_zip(src)
             if zf is None:
@@ -139,7 +136,6 @@ class LOBDataset(Dataset):
                             'mid_price': mid
                         })
             zf.close()
-
         records.sort(key=lambda x: x['ts'])
         n = len(records)
         for i in range(n):
@@ -151,10 +147,11 @@ class LOBDataset(Dataset):
                     break
             if target_index is None:
                 break
-            # Вычисляем процентное изменение: (future - current) / current
             start_mid = records[i]['mid_price']
             target_mid = records[target_index]['mid_price']
             target_delta = (target_mid - start_mid) / start_mid
+            if abs(target_delta) > MAX_TARGET_CHANGE_PERCENT:
+                continue
             if i - self.sequence_length + 1 < 0:
                 continue
             seq_features = []

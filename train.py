@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
 import optuna
-from dataset import LOBDataset
+from dataset import LOBDataset, generate_date_urls
 from model import OrderBookTransformer
 from config import (
     TRAIN_NUM_EPOCHS, TRAIN_BATCH_SIZE, TRAINING_DATE_RANGE, SEQUENCE_LENGTH,
@@ -12,19 +12,13 @@ from config import (
 )
 import numpy as np
 from tqdm import tqdm
-from dataset import generate_date_urls  # импортируем функцию генерации URL
 
-# Для обучения используем список URL, сгенерированный по диапазону дат
+# Генерируем список URL на основе диапазона дат
 TRAINING_DATA_URLS = ",".join(generate_date_urls(TRAINING_DATE_RANGE, URL_TEMPLATE))
 
 def custom_loss(predictions, targets, min_signal_percent=MIN_SIGNAL_PERCENT, penalty_factor=PENALTY_FACTOR):
-    """
-    Функция потерь, состоящая из MSE и дополнительного штрафа:
-      - Если для лонга (prediction > min_signal_percent) целевое изменение оказывается отрицательным,
-      - Если для шорта (prediction < -min_signal_percent) целевое изменение оказывается положительным.
-    Штраф пропорционален квадрату размера убытка.
-    """
     mse = (predictions - targets) ** 2
+    # Штрафуем, если предсказание указывает на торговый сигнал, но целевое изменение имеет противоположный знак
     long_mask = predictions > min_signal_percent
     long_penalty = torch.where(long_mask & (targets < 0), (-targets) ** 2, torch.zeros_like(targets))
     short_mask = predictions < -min_signal_percent
