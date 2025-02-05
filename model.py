@@ -29,7 +29,6 @@ class CombinedModel(nn.Module):
         self.fc_out = nn.Linear(model_dim, 1)
     def forward(self, x):
         x = self.embedding(x)
-        # Добавляем временную размерность (1, batch_size, model_dim)
         x = x.unsqueeze(1)
         x = self.pos_encoder(x)
         x = x.transpose(0, 1)

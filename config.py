@@ -4,18 +4,16 @@
 #############################################
 
 # --- Data settings ---
-# Используем более свежие данные – тренировочные диапазоны с 2024 года.
+# Используем данные с 2024 года (свежие данные)
 TRAINING_DATE_RANGES = [
     "2024-05-01,2024-12-31",   # Bullish период
     "2024-01-01,2024-04-30"    # Bearish период
 ]
-# Шаблон URL для исторических LOB-данных; {pair} будет заменён на торговую пару (без слэша), {date} – на дату
+# Шаблон URL для исторических LOB-данных; {pair} заменяется на торговую пару (например, BTCUSDT), {date} – на дату
 URL_TEMPLATE = "https://quote-saver.bycsi.com/orderbook/linear/{pair}/{date}_{pair}_ob500.data.zip"
 
 # --- Trading pairs ---
-# Используем топ-10 пар
-TRAINING_PAIRS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "ADAUSDT", "XRPUSDT",
-                  "SOLUSDT", "DOTUSDT", "DOGEUSDT", "LTCUSDT", "MATICUSDT"]
+# Теперь единый список пар, используемый и для обучения, и для live‑трейдинга
 SYMBOLS = ["BTC/USDT", "ETH/USDT", "BNB/USDT", "ADA/USDT", "XRP/USDT",
            "SOL/USDT", "DOT/USDT", "DOGE/USDT", "LTC/USDT", "MATIC/USDT"]
 
@@ -44,7 +42,7 @@ TRAIN_BATCH_SIZE    = 256
 TRAIN_LEARNING_RATE = 1e-4
 
 # --- LOB processing parameters ---
-SEQUENCE_LENGTH = 10    # Количество снимков LOB в последовательности
+SEQUENCE_LENGTH = 10    # Количество LOB-снимков в последовательности
 HORIZON_MS      = 10000 # Горизонт для расчёта target (10 сек)
 NUM_LEVELS      = 5
 
@@ -54,9 +52,6 @@ CANDLE_TOTAL_HOURS = 5          # За 5 часов → 60 свечей
 CANDLE_FEATURES_PER_CANDLE = 2  # return и range → 120 признаков
 
 # --- Model parameters ---
-# Общий размер входного вектора = LOB_input + Candle_input,
-# где LOB_input = SEQUENCE_LENGTH * (NUM_LEVELS*4),
-# Candle_input = (CANDLE_TOTAL_HOURS*60/CANDLE_INTERVAL_MIN) * 2.
 LOB_INPUT_DIM = SEQUENCE_LENGTH * (NUM_LEVELS * 4)
 CANDLE_COUNT = int((CANDLE_TOTAL_HOURS * 60) / CANDLE_INTERVAL_MIN)
 CANDLE_INPUT_DIM = CANDLE_COUNT * CANDLE_FEATURES_PER_CANDLE
@@ -80,8 +75,6 @@ MIN_SIGNAL_PERCENT = 0.0005  # 0.05%
 MAX_TARGET_CHANGE_PERCENT = 0.2  # 20%
 
 # --- Market conditions ---
-# Используем историческую медианную волатильность биткоина: обычно около 5–6% за 5 минут.
-# Добавляем запас, чтобы не торговать при экстремальных скачках.
 MAX_VOLATILITY_THRESHOLD = 0.1   # 10%
 
 # --- Live trading settings ---

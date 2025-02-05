@@ -1,23 +1,28 @@
-# train.py
+# train_transformer.py
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, random_split, TensorDataset
 import optuna
-from dataset import LOBDataset, generate_date_urls
 from model import CombinedModel, TOTAL_INPUT_DIM
-from config import (
-    TRAIN_NUM_EPOCHS, TRAIN_BATCH_SIZE, TRAINING_DATE_RANGES, SEQUENCE_LENGTH,
-    HORIZON_MS, NUM_LEVELS, PENALTY_FACTOR, MIN_SIGNAL_PERCENT, URL_TEMPLATE
-)
+from config import TRAIN_NUM_EPOCHS, TRAIN_BATCH_SIZE, TRAINING_DATE_RANGES, MIN_SIGNAL_PERCENT, PENALTY_FACTOR
 import numpy as np
 from tqdm import tqdm
+import pickle
 
-# Объединяем данные из диапазонов
-TRAINING_DATA_URLS = []
-for dr in TRAINING_DATE_RANGES:
-    TRAINING_DATA_URLS.extend(generate_date_urls(dr, URL_TEMPLATE))
-TRAINING_DATA_URLS = ",".join(TRAINING_DATA_URLS)
+# Загружаем сохранённый датасет
+with open("dataset.pkl", "rb") as f:
+    dataset_data = pickle.load(f)
+features = dataset_data["features"]
+targets = dataset_data["targets"]
+full_dataset = TensorDataset(torch.from_numpy(features), torch.from_numpy(targets))
+
+n_total = len(full_dataset)
+n_train = int(n_total * 0.8)
+n_val = n_total - n_train
+train_dataset, val_dataset = random_split(full_dataset, [n_train, n_val])
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def custom_loss(predictions, targets, min_signal_percent=MIN_SIGNAL_PERCENT, penalty_factor=PENALTY_FACTOR):
     mse = (predictions - targets) ** 2
@@ -36,68 +41,51 @@ def objective(trial):
     dropout = trial.suggest_float("dropout", 0.0, 0.5)
     learning_rate = trial.suggest_loguniform("learning_rate", 1e-4, 1e-2)
     
-    dataset = LOBDataset(TRAINING_DATA_URLS, sequence_length=SEQUENCE_LENGTH, horizon_ms=HORIZON_MS, num_levels=NUM_LEVELS)
-    n_total = len(dataset)
-    n_train = int(n_total * 0.8)
-    n_val = n_total - n_train
-    train_dataset, val_dataset = random_split(dataset, [n_train, n_val])
+    model = CombinedModel(input_dim=TOTAL_INPUT_DIM, model_dim=model_dim, num_layers=num_layers, nhead=nhead, dropout=dropout)
+    model.to(device)
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     
     train_loader = DataLoader(train_dataset, batch_size=TRAIN_BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=TRAIN_BATCH_SIZE, shuffle=False)
     
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = CombinedModel(input_dim=TOTAL_INPUT_DIM, model_dim=model_dim, num_layers=num_layers, nhead=nhead, dropout=dropout)
-    model.to(device)
-    
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    
     num_epochs = TRAIN_NUM_EPOCHS
-    pbar_epoch = tqdm(range(num_epochs), desc="Epochs")
-    for epoch in pbar_epoch:
+    for epoch in range(num_epochs):
         model.train()
         train_loss = 0.0
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}", leave=False)
-        for features, targets in pbar:
-            features = features.to(device)
-            targets = targets.to(device)
+        for features_batch, targets_batch in train_loader:
+            features_batch = features_batch.to(device)
+            targets_batch = targets_batch.to(device)
             optimizer.zero_grad()
-            outputs = model(features)
-            loss = custom_loss(outputs, targets, min_signal_percent=MIN_SIGNAL_PERCENT, penalty_factor=PENALTY_FACTOR)
+            outputs = model(features_batch)
+            loss = custom_loss(outputs, targets_batch, min_signal_percent=MIN_SIGNAL_PERCENT, penalty_factor=PENALTY_FACTOR)
             loss.backward()
             optimizer.step()
-            train_loss += loss.item() * features.size(0)
-            pbar.set_postfix(loss=loss.item())
+            train_loss += loss.item() * features_batch.size(0)
         train_loss /= len(train_dataset)
         
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
-            for features, targets in val_loader:
-                features = features.to(device)
-                targets = targets.to(device)
-                outputs = model(features)
-                loss = custom_loss(outputs, targets, min_signal_percent=MIN_SIGNAL_PERCENT, penalty_factor=PENALTY_FACTOR)
-                val_loss += loss.item() * features.size(0)
+            for features_batch, targets_batch in val_loader:
+                features_batch = features_batch.to(device)
+                targets_batch = targets_batch.to(device)
+                outputs = model(features_batch)
+                loss = custom_loss(outputs, targets_batch, min_signal_percent=MIN_SIGNAL_PERCENT, penalty_factor=PENALTY_FACTOR)
+                val_loss += loss.item() * features_batch.size(0)
         val_loss /= len(val_dataset)
-        pbar_epoch.set_postfix(val_loss=val_loss)
         trial.report(val_loss, epoch)
         if trial.should_prune():
             raise optuna.TrialPruned()
-    
     return val_loss
 
 if __name__ == '__main__':
     study = optuna.create_study(direction="minimize")
-    study.optimize(objective, n_trials=20)
-    
+    study.optimize(lambda trial: objective(trial), n_trials=20)
     print("Best trial:")
     trial = study.best_trial
-    print(f"  Value: {trial.value}")
     for key, value in trial.params.items():
-        print(f"    {key}: {value}")
-    
+        print(f"{key}: {value}")
     best_params = trial.params
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = CombinedModel(input_dim=TOTAL_INPUT_DIM,
                           model_dim=best_params["model_dim"],
                           num_layers=best_params["num_layers"],
@@ -106,27 +94,21 @@ if __name__ == '__main__':
     model.to(device)
     optimizer = optim.Adam(model.parameters(), lr=best_params["learning_rate"])
     
-    dataset = LOBDataset(TRAINING_DATA_URLS, sequence_length=SEQUENCE_LENGTH, horizon_ms=HORIZON_MS, num_levels=NUM_LEVELS)
-    train_loader = DataLoader(dataset, batch_size=TRAIN_BATCH_SIZE, shuffle=True)
-    
-    pbar_epoch = tqdm(range(TRAIN_NUM_EPOCHS), desc="Final Model Epochs")
-    for epoch in pbar_epoch:
+    train_loader = DataLoader(full_dataset, batch_size=TRAIN_BATCH_SIZE, shuffle=True)
+    for epoch in range(TRAIN_NUM_EPOCHS):
         model.train()
         epoch_loss = 0.0
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}", leave=False)
-        for features, targets in pbar:
-            features = features.to(device)
-            targets = targets.to(device)
+        for features_batch, targets_batch in tqdm(train_loader, desc=f"Epoch {epoch+1}"):
+            features_batch = features_batch.to(device)
+            targets_batch = targets_batch.to(device)
             optimizer.zero_grad()
-            outputs = model(features)
-            loss = custom_loss(outputs, targets, min_signal_percent=MIN_SIGNAL_PERCENT, penalty_factor=PENALTY_FACTOR)
+            outputs = model(features_batch)
+            loss = custom_loss(outputs, targets_batch, min_signal_percent=MIN_SIGNAL_PERCENT, penalty_factor=PENALTY_FACTOR)
             loss.backward()
             optimizer.step()
-            epoch_loss += loss.item() * features.size(0)
-            pbar.set_postfix(loss=loss.item())
-        epoch_loss /= len(dataset)
-        pbar_epoch.set_postfix(epoch_loss=epoch_loss)
-        print(f"Final Model Epoch {epoch+1}/{TRAIN_NUM_EPOCHS}, Loss: {epoch_loss:.6f}")
+            epoch_loss += loss.item() * features_batch.size(0)
+        epoch_loss /= len(full_dataset)
+        print(f"Epoch {epoch+1}/{TRAIN_NUM_EPOCHS}, Loss: {epoch_loss:.6f}")
     
     torch.save(model.state_dict(), "final_model.pth")
     print("Final model saved as final_model.pth")

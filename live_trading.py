@@ -58,7 +58,7 @@ async def trade_symbol(symbol, model, device):
     global error_cooldown_until, position_history
     position = None
     last_trade_time = 0
-    lob_buffer = []  # Храним последние LOB признаки (flattened)
+    lob_buffer = []  # Flattened LOB data
     daily_profit = 0.0
     current_day = time.strftime("%Y-%m-%d", time.localtime())
     
@@ -214,7 +214,7 @@ async def main():
     model.to(device)
     model.eval()
     logging.info("Model loaded successfully.")
-
+    
     async with aiohttp.ClientSession() as session:
         ws_task = asyncio.create_task(start_bybit_ws())
         tasks = []

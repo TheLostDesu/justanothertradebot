@@ -17,7 +17,6 @@ def generate_date_urls(date_range, template):
     current_date = start_date
     while current_date <= end_date:
         date_str = current_date.strftime("%Y-%m-%d")
-        # Для обучения подбираем данные по каждой паре; здесь для упрощения используем BTCUSDT, но в дальнейшем можно делать цикл по TRAINING_PAIRS
         urls.append(template.format(pair="BTCUSDT", date=date_str))
         current_date += timedelta(days=1)
     return urls
@@ -65,14 +64,6 @@ def get_mid_price(ob):
     return (best_bid + best_ask) / 2.0
 
 def compute_candle_features(records, end_time):
-    """
-    Вычисляет свечные признаки за 5 часов до end_time.
-    Для каждого 5-минутного интервала вычисляется:
-      - return = (close - open) / open
-      - range = (high - low) / open
-    Если данных нет, используются 0.
-    Возвращает список признаков длиной: (CANDLE_TOTAL_HOURS*60/CANDLE_INTERVAL_MIN)*CANDLE_FEATURES_PER_CANDLE
-    """
     interval_ms = CANDLE_INTERVAL_MIN * 60 * 1000
     candle_count = int((CANDLE_TOTAL_HOURS * 60) / CANDLE_INTERVAL_MIN)
     start_time = end_time - (CANDLE_TOTAL_HOURS * 60 * 1000)
@@ -104,12 +95,12 @@ class LOBDataset(Dataset):
         self.samples = []
         self.records = []
         all_urls = []
-        # Объединяем URL из всех диапазонов
         if isinstance(zip_sources, list):
             for dr in zip_sources:
                 all_urls.extend(generate_date_urls(dr, URL_TEMPLATE))
         else:
             all_urls = generate_date_urls(zip_sources, URL_TEMPLATE)
+        current_ob = None
         for src in all_urls:
             zf = open_zip(src)
             if zf is None:
@@ -122,14 +113,16 @@ class LOBDataset(Dataset):
                         except Exception:
                             continue
                         data = record.get('data', {})
-                        if record.get('type') == 'snapshot' or data.get('u') == 1:
-                            ob = {'a': {}, 'b': {}}
+                        r_type = record.get('type')
+                        if r_type == 'snapshot' or data.get('u') == 1:
+                            # Сброс состояния ордербука
+                            current_ob = {'a': {}, 'b': {}}
                             if 'a' in data:
                                 for level in data['a']:
                                     try:
                                         price = float(level[0])
                                         size = float(level[1])
-                                        ob['a'][price] = size
+                                        current_ob['a'][price] = size
                                     except Exception:
                                         continue
                             if 'b' in data:
@@ -137,18 +130,34 @@ class LOBDataset(Dataset):
                                     try:
                                         price = float(level[0])
                                         size = float(level[1])
-                                        ob['b'][price] = size
+                                        current_ob['b'][price] = size
                                     except Exception:
                                         continue
-                        elif record.get('type') == 'delta':
-                            # Для обучения пропускаем delta
-                            continue
+                        elif r_type == 'delta':
+                            if current_ob is None:
+                                continue
+                            # Обновляем текущее состояние с учетом delta
+                            for side in ['a', 'b']:
+                                if side in data:
+                                    for update in data[side]:
+                                        try:
+                                            price = float(update[0])
+                                            size = float(update[1])
+                                        except Exception:
+                                            continue
+                                        if size == 0.0:
+                                            if price in current_ob[side]:
+                                                del current_ob[side][price]
+                                        else:
+                                            current_ob[side][price] = size
                         else:
                             continue
-                        mid = get_mid_price(ob)
+                        if current_ob is None:
+                            continue
+                        mid = get_mid_price(current_ob)
                         if mid is None:
                             continue
-                        feats = get_features_from_orderbook(ob, self.num_levels)
+                        feats = get_features_from_orderbook(current_ob, self.num_levels)
                         ts = record.get('ts')
                         try:
                             ts = int(ts)
@@ -188,7 +197,6 @@ class LOBDataset(Dataset):
 
     def __len__(self):
         return len(self.samples)
-
     def __getitem__(self, idx):
         sample = self.samples[idx]
         return sample["features"], sample["target"]
