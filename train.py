@@ -1,16 +1,15 @@
-# train_transformer.py
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split, TensorDataset
 import optuna
 from model import CombinedModel, TOTAL_INPUT_DIM
-from config import TRAIN_NUM_EPOCHS, TRAIN_BATCH_SIZE, TRAINING_DATE_RANGES, MIN_SIGNAL_PERCENT, PENALTY_FACTOR
+from config import TRAIN_NUM_EPOCHS, TRAIN_BATCH_SIZE, MIN_SIGNAL_PERCENT, PENALTY_FACTOR
 import numpy as np
 from tqdm import tqdm
 import pickle
 
-# Загружаем сохранённый датасет
+# Загружаем датасет
 with open("dataset.pkl", "rb") as f:
     dataset_data = pickle.load(f)
 features = dataset_data["features"]

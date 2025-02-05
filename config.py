@@ -4,16 +4,15 @@
 #############################################
 
 # --- Data settings ---
-# Используем данные с 2024 года (свежие данные)
 TRAINING_DATE_RANGES = [
     "2024-05-01,2024-12-31",   # Bullish период
     "2024-01-01,2024-04-30"    # Bearish период
 ]
-# Шаблон URL для исторических LOB-данных; {pair} заменяется на торговую пару (например, BTCUSDT), {date} – на дату
+# Шаблон URL для исторических LOB-данных; {pair} заменяется на торговую пару (без слэша), {date} – на дату
 URL_TEMPLATE = "https://quote-saver.bycsi.com/orderbook/linear/{pair}/{date}_{pair}_ob500.data.zip"
 
 # --- Trading pairs ---
-# Теперь единый список пар, используемый и для обучения, и для live‑трейдинга
+# Используем единый список пар для обучения и live‑трейдинга
 SYMBOLS = ["BTC/USDT", "ETH/USDT", "BNB/USDT", "ADA/USDT", "XRP/USDT",
            "SOL/USDT", "DOT/USDT", "DOGE/USDT", "LTC/USDT", "MATIC/USDT"]
 

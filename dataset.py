@@ -115,7 +115,6 @@ class LOBDataset(Dataset):
                         data = record.get('data', {})
                         r_type = record.get('type')
                         if r_type == 'snapshot' or data.get('u') == 1:
-                            # Сброс состояния ордербука
                             current_ob = {'a': {}, 'b': {}}
                             if 'a' in data:
                                 for level in data['a']:
@@ -136,7 +135,6 @@ class LOBDataset(Dataset):
                         elif r_type == 'delta':
                             if current_ob is None:
                                 continue
-                            # Обновляем текущее состояние с учетом delta
                             for side in ['a', 'b']:
                                 if side in data:
                                     for update in data[side]:

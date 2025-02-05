@@ -3,20 +3,28 @@ import pickle
 from dataset import LOBDataset, generate_date_urls
 from config import TRAINING_DATE_RANGES, URL_TEMPLATE, NUM_LEVELS, SEQUENCE_LENGTH, HORIZON_MS, SYMBOLS
 import numpy as np
+from tqdm import tqdm  # Импортируем tqdm для прогресс-бара
 
 def build_dataset():
     all_urls = []
-    # Для каждой даты и для каждой торговой пары формируем URL
+    # Для каждой даты и для каждой торговой пары из SYMBOLS формируем URL
     for dr in TRAINING_DATE_RANGES:
         for sym in SYMBOLS:
-            pair = sym.replace("/", "")  # Преобразуем "BTC/USDT" → "BTCUSDT"
+            pair = sym.replace("/", "")
+            # Подставляем пару в шаблон URL
             urls = generate_date_urls(dr, URL_TEMPLATE.replace("{pair}", pair))
             all_urls.extend(urls)
-    # Создаём датасет, который будет включать только те данные, по которым мы будем трейдить
-    dataset = LOBDataset(all_urls, sequence_length=SEQUENCE_LENGTH, horizon_ms=HORIZON_MS, num_levels=NUM_LEVELS)
+    # Выводим количество найденных URL
+    print(f"Total archives to process: {len(all_urls)}")
+    # Используем tqdm для отображения прогресса при обработке архивов
+    dataset = LOBDataset(tqdm(all_urls, desc="Processing archives"), 
+                         sequence_length=SEQUENCE_LENGTH, 
+                         horizon_ms=HORIZON_MS, 
+                         num_levels=NUM_LEVELS)
     features = []
     targets = []
-    for feat, target in dataset:
+    # Можно также обернуть цикл по элементам датасета в tqdm, если датасет очень большой
+    for feat, target in tqdm(dataset, desc="Building dataset samples"):
         features.append(feat)
         targets.append(target)
     features = np.array(features)
