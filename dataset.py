@@ -14,11 +14,15 @@ import io
 import json
 import zipfile
 from tqdm import tqdm
+from sortedcontainers import SortedList
 from orderbook import OrderBookSide, get_features_from_orderbook, get_mid_price
 from config import (TRAINING_DATE_RANGES, URL_TEMPLATE, SYMBOLS, NUM_LEVELS,
                     SEQUENCE_LENGTH, HORIZON_MS, MAX_TARGET_CHANGE_PERCENT,
                     CANDLE_INTERVAL_MIN, CANDLE_TOTAL_HOURS)
 
+# -----------------------------------------------------------------------------
+# Функции расчёта признаков
+# -----------------------------------------------------------------------------
 def generate_date_urls(date_range, template):
     """Принимает строку 'YYYY-MM-DD,YYYY-MM-DD' и возвращает список URL-ов."""
     start_str, end_str = date_range.split(',')
@@ -80,6 +84,9 @@ def compute_candle_features(records, end_time):
         features.extend([ret, rng])
     return features
 
+# -----------------------------------------------------------------------------
+# Обработка архивного файла
+# -----------------------------------------------------------------------------
 def process_archive_file(filepath):
     """
     Обрабатывает локальный zip-файл и возвращает список sample-словарей,
@@ -191,6 +198,9 @@ def process_archive_file(filepath):
         })
     return samples
 
+# -----------------------------------------------------------------------------
+# Продюсер и потребитель
+# -----------------------------------------------------------------------------
 def download_archive(url, zips_dir):
     """
     Скачивает архив по URL и сохраняет его в папку zips.
@@ -239,6 +249,7 @@ def main():
 
     download_queue = queue.Queue()
 
+    # Сохраняем архивы не более чем 100 файлов вперед.
     def downloader():
         for url in tqdm(all_urls, desc="Downloading archives"):
             while download_queue.qsize() >= 100:
@@ -250,7 +261,9 @@ def main():
     downloader_thread = threading.Thread(target=downloader)
     downloader_thread.start()
 
-    processed_results = []
+    # Словарь для накопления сэмплов по дням (или комбинации "пара_дата").
+    daily_samples = {}
+
     num_workers = os.cpu_count() or 4
     futures = []
     with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
@@ -263,21 +276,24 @@ def main():
             except queue.Empty:
                 continue
 
-        for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="Processing downloaded archives"):
+        # Для каждого обработанного архива определяем дату (и пару) по имени файла
+        # и группируем сэмплы в daily_samples.
+        regex = re.compile(r"(\d{4}-\d{2}-\d{2})_([A-Z]+)_ob500\.data\.zip")
+        for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures),
+                               desc="Processing downloaded archives"):
             filepath = getattr(future, "filepath", "unknown")
             try:
                 samples = future.result()
-                m = re.search(r"(\d{4}-\d{2}-\d{2})_([A-Z]+)_ob500\.data\.zip", os.path.basename(filepath))
+                m = regex.search(os.path.basename(filepath))
                 if m:
                     date_str = m.group(1)
                     pair = m.group(2)
+                    key = f"{pair}_{date_str}"
                 else:
-                    date_str = "unknown"
-                    pair = "unknown"
-                out_filename = f"data/{pair}_{date_str}.pkl"
-                with open(out_filename, "wb") as f:
-                    pickle.dump({"samples": samples}, f)
-                processed_results.append((filepath, len(samples)))
+                    key = "unknown"
+                if key not in daily_samples:
+                    daily_samples[key] = []
+                daily_samples[key].extend(samples)
             except Exception as e:
                 print(f"Error processing {filepath}: {e}")
             finally:
@@ -287,8 +303,23 @@ def main():
                     print(f"Не удалось удалить файл {filepath}: {e}")
 
     downloader_thread.join()
-    total_samples = sum(s for _, s in processed_results)
-    print(f"Dataset built and saved. Total samples: {total_samples}")
+
+    # Для каждого ключа (пара_дата) сохраняем отдельный NPZ-файл.
+    for key, samples in daily_samples.items():
+        if samples:
+            features_list = [sample["features"] for sample in samples]
+            targets_list = [sample["target"] for sample in samples]
+            try:
+                X = np.stack(features_list)  # shape: (n_samples, feature_dim)
+            except Exception as e:
+                print(f"Error stacking features for {key}: {e}")
+                continue
+            Y = np.array(targets_list)   # shape: (n_samples,)
+            output_path = os.path.join("data", f"{key}.npz")
+            np.savez_compressed(output_path, X=X, Y=Y)
+            print(f"Saved dataset for {key} to {output_path}. Total samples: {X.shape[0]}")
+        else:
+            print(f"No samples for {key}.")
 
 if __name__ == '__main__':
     main()
