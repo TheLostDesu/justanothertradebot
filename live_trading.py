@@ -6,14 +6,11 @@ import numpy as np
 import torch
 import logging
 from model import CombinedModel
-from config import (
-    TIMEFRAME_SECONDS, NUM_LEVELS, SEQUENCE_LENGTH, MIN_SIGNAL_PERCENT, MIN_CONFIDENCE,
-    SYMBOLS, TRADE_MAX_DURATION, TRADE_COOLDOWN, DEFAULT_LEVERAGE,
-    ADAPTIVE_TP_MULTIPLIER, SL_FACTOR, RISK_PERCENTAGE,
-    CONFIDENCE_SCALE, CONFIDENCE_WEIGHT, MAX_VOLATILITY_THRESHOLD,
-    DEFAULT_STOP_LOSS_FACTOR, DEFAULT_TAKE_PROFIT_FACTOR, DEFAULT_TRAILING_STOP,
-    ERROR_COOLDOWN_SECONDS, NEGATIVE_PERFORMANCE_COOLDOWN_SECONDS, MIN_AVG_PROFIT_THRESHOLD, TOTAL_INPUT_DIM
-)
+from config import (TIMEFRAME_SECONDS, NUM_LEVELS, SEQUENCE_LENGTH, MIN_SIGNAL_PERCENT,
+                    MIN_CONFIDENCE, SYMBOLS, TRADE_MAX_DURATION, TRADE_COOLDOWN,
+                    DEFAULT_LEVERAGE, DEFAULT_STOP_LOSS_FACTOR, DEFAULT_TAKE_PROFIT_FACTOR,
+                    DEFAULT_TRAILING_STOP, ERROR_COOLDOWN_SECONDS, NEGATIVE_PERFORMANCE_COOLDOWN_SECONDS,
+                    MIN_AVG_PROFIT_THRESHOLD, TOTAL_INPUT_DIM, RISK_PERCENTAGE, CONFIDENCE_SCALE, MAX_VOLATILITY_THRESHOLD)
 from bybit_ws import start_bybit_ws, get_orderbook
 from dataset import get_features_from_orderbook, get_mid_price
 from bybit_api import fetch_balance, create_order, fetch_candles
@@ -65,8 +62,7 @@ async def trade_symbol(symbol, model, device):
     def check_performance():
         if len(position_history) >= 3:
             recent = position_history[-3:]
-            avg_profit = sum(recent) / len(recent)
-            return avg_profit
+            return sum(recent) / len(recent)
         return 0.0
 
     async with aiohttp.ClientSession() as session:
@@ -84,9 +80,8 @@ async def trade_symbol(symbol, model, device):
                     daily_profit = 0.0
                     current_day = now_day
 
-                avg_profit = check_performance()
-                if avg_profit < MIN_AVG_PROFIT_THRESHOLD:
-                    logging.info(f"[{symbol}] Recent avg profit {avg_profit:.4f} below threshold; performance cooldown.")
+                if check_performance() < MIN_AVG_PROFIT_THRESHOLD:
+                    logging.info(f"[{symbol}] Recent avg profit below threshold; performance cooldown.")
                     await asyncio.sleep(NEGATIVE_PERFORMANCE_COOLDOWN_SECONDS)
                     continue
 
@@ -203,8 +198,7 @@ async def trade_symbol(symbol, model, device):
                 
 async def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    input_dim = TOTAL_INPUT_DIM
-    model = CombinedModel(input_dim=input_dim)
+    model = CombinedModel(input_dim=TOTAL_INPUT_DIM)
     model_path = "final_model.pth"
     try:
         model.load_state_dict(torch.load(model_path, map_location=device))
@@ -217,9 +211,7 @@ async def main():
     
     async with aiohttp.ClientSession() as session:
         ws_task = asyncio.create_task(start_bybit_ws())
-        tasks = []
-        for symbol in SYMBOLS:
-            tasks.append(trade_symbol(symbol, model, device))
+        tasks = [trade_symbol(symbol, model, device) for symbol in SYMBOLS]
         await asyncio.gather(*tasks)
         await ws_task
 

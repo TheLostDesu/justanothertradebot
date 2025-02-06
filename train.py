@@ -1,3 +1,4 @@
+# train_transformer.py
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -9,7 +10,16 @@ import numpy as np
 from tqdm import tqdm
 import pickle
 
-# Загружаем датасет
+def custom_loss(predictions, targets, min_signal_percent=MIN_SIGNAL_PERCENT, penalty_factor=PENALTY_FACTOR):
+    mse = (predictions - targets) ** 2
+    long_mask = predictions > min_signal_percent
+    long_penalty = torch.where(long_mask & (targets < 0), (-targets) ** 2, torch.zeros_like(targets))
+    short_mask = predictions < -min_signal_percent
+    short_penalty = torch.where(short_mask & (targets > 0), (targets) ** 2, torch.zeros_like(targets))
+    penalty = long_penalty + short_penalty
+    return (mse + penalty_factor * penalty).mean()
+
+# Загружаем объединённый датасет из файла dataset.pkl
 with open("dataset.pkl", "rb") as f:
     dataset_data = pickle.load(f)
 features = dataset_data["features"]
@@ -23,16 +33,6 @@ train_dataset, val_dataset = random_split(full_dataset, [n_train, n_val])
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def custom_loss(predictions, targets, min_signal_percent=MIN_SIGNAL_PERCENT, penalty_factor=PENALTY_FACTOR):
-    mse = (predictions - targets) ** 2
-    long_mask = predictions > min_signal_percent
-    long_penalty = torch.where(long_mask & (targets < 0), (-targets) ** 2, torch.zeros_like(targets))
-    short_mask = predictions < -min_signal_percent
-    short_penalty = torch.where(short_mask & (targets > 0), (targets) ** 2, torch.zeros_like(targets))
-    penalty = long_penalty + short_penalty
-    total_loss = mse + penalty_factor * penalty
-    return total_loss.mean()
-
 def objective(trial):
     model_dim = trial.suggest_int("model_dim", 64, 256)
     num_layers = trial.suggest_int("num_layers", 2, 6)
@@ -40,7 +40,8 @@ def objective(trial):
     dropout = trial.suggest_float("dropout", 0.0, 0.5)
     learning_rate = trial.suggest_loguniform("learning_rate", 1e-4, 1e-2)
     
-    model = CombinedModel(input_dim=TOTAL_INPUT_DIM, model_dim=model_dim, num_layers=num_layers, nhead=nhead, dropout=dropout)
+    model = CombinedModel(input_dim=TOTAL_INPUT_DIM, model_dim=model_dim,
+                          num_layers=num_layers, nhead=nhead, dropout=dropout)
     model.to(device)
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     

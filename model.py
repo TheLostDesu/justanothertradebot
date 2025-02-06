@@ -24,8 +24,8 @@ class CombinedModel(nn.Module):
         super(CombinedModel, self).__init__()
         self.embedding = nn.Linear(input_dim, model_dim)
         self.pos_encoder = PositionalEncoding(model_dim, dropout)
-        encoder_layers = nn.TransformerEncoderLayer(d_model=model_dim, nhead=nhead, dropout=dropout)
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers=num_layers)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=model_dim, nhead=nhead, dropout=dropout)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.fc_out = nn.Linear(model_dim, 1)
     def forward(self, x):
         x = self.embedding(x)

@@ -10,10 +10,7 @@ orderbooks = {}
 async def subscribe_orderbook(ws, symbol):
     symbol_formatted = symbol.replace("/", "")
     channel = f"orderBookL2_25.{symbol_formatted}"
-    sub_msg = {
-        "op": "subscribe",
-        "args": [channel]
-    }
+    sub_msg = {"op": "subscribe", "args": [channel]}
     await ws.send(json.dumps(sub_msg))
     logging.info(f"Subscribed to {channel}")
 
