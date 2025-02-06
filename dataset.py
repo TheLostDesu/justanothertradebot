@@ -19,6 +19,9 @@ from config import (TRAINING_DATE_RANGES, URL_TEMPLATE, SYMBOLS, NUM_LEVELS,
                     SEQUENCE_LENGTH, HORIZON_MS, MAX_TARGET_CHANGE_PERCENT,
                     CANDLE_INTERVAL_MIN, CANDLE_TOTAL_HOURS)
 
+import logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
 # -----------------------------------------------------------------------------
 # Функции расчёта признаков
 # -----------------------------------------------------------------------------
@@ -43,7 +46,7 @@ def open_zip(source):
             r.raise_for_status()
             return zipfile.ZipFile(io.BytesIO(r.content))
         except Exception as e:
-            print(f"Error downloading {source}: {e}")
+            logging.error(f"Error downloading {source}: {e}")
             return None
     else:
         try:
@@ -51,7 +54,7 @@ def open_zip(source):
                 content = f.read()
             return zipfile.ZipFile(io.BytesIO(content))
         except Exception as e:
-            print(f"Error opening zip file {source}: {e}")
+            logging.error(f"Error opening zip file {source}: {e}")
             return None
 
 def compute_candle_features(records, end_time):
@@ -87,21 +90,17 @@ def compute_candle_features(records, end_time):
 # Обработка архивного файла
 # -----------------------------------------------------------------------------
 def process_archive_file(filepath):
-    """
-    Обрабатывает локальный zip-файл и возвращает список sample-словарей,
-    где каждый sample содержит "features" (np.array) и "target" (np.float32).
-    Orderbook хранится с использованием OrderBookSide для эффективного обновления.
-    """
+    logging.info(f"Processing file: {filepath}")
     try:
         with open(filepath, "rb") as f:
             content = f.read()
     except Exception as e:
-        print(f"Error reading file {filepath}: {e}")
+        logging.error(f"Error reading file {filepath}: {e}")
         return []
     try:
         zf = zipfile.ZipFile(io.BytesIO(content))
     except Exception as e:
-        print(f"Error opening zip file {filepath}: {e}")
+        logging.error(f"Error opening zip file {filepath}: {e}")
         return []
     records = []
     current_ob = None
@@ -151,7 +150,6 @@ def process_archive_file(filepath):
                     continue
                 if current_ob is None:
                     continue
-                # Преобразуем OrderBookSide в обычные списки для дальнейшей обработки.
                 ob_lists = {
                     'a': current_ob['a'].get_list(),
                     'b': current_ob['b'].get_list()
@@ -195,16 +193,13 @@ def process_archive_file(filepath):
             "features": np.array(combined, dtype=np.float32),
             "target": np.float32(target_delta)
         })
+    logging.info(f"Finished processing {filepath}. Generated {len(samples)} samples.")
     return samples
 
 # -----------------------------------------------------------------------------
-# Продюсер и потребитель
+# Продюсер и потребитель: скачивание архивов
 # -----------------------------------------------------------------------------
 def download_archive(url, zips_dir):
-    """
-    Скачивает архив по URL и сохраняет его в папку zips.
-    Возвращает путь к сохранённому файлу или None при ошибке.
-    """
     try:
         response = requests.get(url)
         response.raise_for_status()
@@ -212,13 +207,14 @@ def download_archive(url, zips_dir):
         filepath = os.path.join(zips_dir, filename)
         with open(filepath, "wb") as f:
             f.write(response.content)
+        logging.info(f"Downloaded: {filepath}")
         return filepath
     except Exception as e:
-        print(f"Error downloading {url}: {e}")
+        logging.error(f"Error downloading {url}: {e}")
         return None
 
 def processor_worker(filepath):
-    print(f"Начинаю обрабатывать архив {os.path.basename(filepath)}")
+    logging.info(f"Started processing archive {os.path.basename(filepath)}")
     return process_archive_file(filepath)
 
 def build_dataset_for_pairs(selected_pairs):
@@ -230,6 +226,23 @@ def build_dataset_for_pairs(selected_pairs):
             all_urls.extend(urls)
     return all_urls
 
+# -----------------------------------------------------------------------------
+# Отдельный поток для записи файлов (одновременно только один)
+# -----------------------------------------------------------------------------
+def writer_thread_func(write_queue, stop_event):
+    logging.info("Writer thread started.")
+    while not stop_event.is_set() or not write_queue.empty():
+        try:
+            output_path, X, Y = write_queue.get(timeout=1)
+            np.savez_compressed(output_path, X=X, Y=Y)
+            logging.info(f"Written file: {output_path} (samples: {X.shape[0]})")
+        except queue.Empty:
+            continue
+    logging.info("Writer thread stopped.")
+
+# -----------------------------------------------------------------------------
+# Основная функция
+# -----------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(description="Dataset builder for trade bot.")
     parser.add_argument("--pair-index", type=int, default=None,
@@ -242,19 +255,20 @@ def main():
         selected_pairs = SYMBOLS
 
     all_urls = build_dataset_for_pairs(selected_pairs)
-    print(f"Total archives to process: {len(all_urls)}")
+    logging.info(f"Total archives to process: {len(all_urls)}")
     os.makedirs("zips", exist_ok=True)
     os.makedirs("data", exist_ok=True)
 
-    download_queue = queue.Queue()
-    stop_event = threading.Event()  # Флаг для остановки потоков
+    download_queue = queue.Queue(maxsize=100)
+    write_queue = queue.Queue()
+    stop_event = threading.Event()
 
-    # Ограничение очереди до 100 архивов
+    # Запуск потока для скачивания архивов
     def downloader():
         for url in tqdm(all_urls, desc="Downloading archives"):
             if stop_event.is_set():
                 break
-            while download_queue.qsize() >= 100:
+            while download_queue.full():
                 if stop_event.is_set():
                     return
                 time.sleep(0.1)
@@ -262,17 +276,21 @@ def main():
             if filepath:
                 download_queue.put(filepath)
 
-    downloader_thread = threading.Thread(target=downloader)
+    downloader_thread = threading.Thread(target=downloader, name="Downloader")
     downloader_thread.start()
+
+    # Запуск отдельного потока для записи файлов (одновременно только один)
+    writer_thread = threading.Thread(target=writer_thread_func, args=(write_queue, stop_event), name="Writer")
+    writer_thread.start()
 
     regex = re.compile(r"(\d{4}-\d{2}-\d{2})_([A-Z]+)_ob500\.data\.zip")
     futures = []
     num_workers = os.cpu_count() or 4
 
     try:
-        from concurrent.futures import ProcessPoolExecutor, as_completed
+        from concurrent.futures import ProcessPoolExecutor, as_completed, TimeoutError
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
-            # Пока загрузчик работает или очередь не пуста – отправляем задачи в пул.
+            # Отправляем задачи в пул, пока скачиватель работает или очередь не пуста
             while downloader_thread.is_alive() or not download_queue.empty():
                 if stop_event.is_set():
                     break
@@ -283,8 +301,8 @@ def main():
                 future = executor.submit(processor_worker, filepath)
                 future.filepath = filepath
                 futures.append(future)
-            # Обрабатываем futures по мере завершения
-            for future in tqdm(as_completed(futures), total=len(futures), desc="Processing downloaded archives"):
+            # Обрабатываем результаты по мере завершения
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Processing archives"):
                 filepath = getattr(future, "filepath", "unknown")
                 try:
                     samples = future.result(timeout=300)
@@ -303,23 +321,33 @@ def main():
                             Y = np.array(targets_list)
                             archive_id = os.path.splitext(os.path.basename(filepath))[0]
                             output_path = os.path.join("data", f"{key}_{archive_id}.npz")
-                            np.savez_compressed(output_path, X=X, Y=Y)
-                            print(f"Saved {output_path}. Total samples: {X.shape[0]}")
+                            # Вместо записи здесь, кладем данные в очередь для writer-а
+                            write_queue.put((output_path, X, Y))
+                            logging.info(f"Queued file for writing: {output_path}")
                         except Exception as e:
-                            print(f"Error saving {filepath}: {e}")
+                            logging.error(f"Error preparing output for {filepath}: {e}")
+                except TimeoutError:
+                    logging.error(f"Timeout processing {filepath}")
+                    future.cancel()
                 except Exception as e:
-                    print(f"Error processing {filepath}: {e}")
+                    logging.error(f"Error processing {filepath}: {e}")
                 finally:
                     try:
                         os.remove(filepath)
+                        logging.info(f"Deleted archive: {filepath}")
                     except Exception as e:
-                        print(f"Не удалось удалить файл {filepath}: {e}")
+                        logging.error(f"Failed to delete file {filepath}: {e}")
     except KeyboardInterrupt:
-        print("Получен KeyboardInterrupt, завершаем работу...")
+        logging.info("KeyboardInterrupt received, stopping...")
         stop_event.set()
     finally:
         downloader_thread.join()
-        print("Обработка завершена.")
+        # Ждем, пока все задачи записи будут обработаны
+        while not write_queue.empty():
+            time.sleep(0.5)
+        stop_event.set()
+        writer_thread.join()
+        logging.info("Processing finished.")
 
 if __name__ == '__main__':
     main()
