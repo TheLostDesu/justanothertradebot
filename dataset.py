@@ -260,50 +260,55 @@ def main():
     downloader_thread = threading.Thread(target=downloader)
     downloader_thread.start()
 
-    # Обработка архивов: по завершении обработки каждого архива сразу сохраняем NPZ-файл
+    # Вместо немедленного ожидания результата мы собираем futures в список.
+    futures = []
     regex = re.compile(r"(\d{4}-\d{2}-\d{2})_([A-Z]+)_ob500\.data\.zip")
     num_workers = os.cpu_count() or 4
-    with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
+
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        # Пока загрузчик работает или очередь не пуста – отправляем задачи в пул.
         while downloader_thread.is_alive() or not download_queue.empty():
             try:
                 filepath = download_queue.get(timeout=1)
             except queue.Empty:
                 continue
+            # Отправляем задачу и сразу сохраняем future в список
             future = executor.submit(processor_worker, filepath)
+            future.filepath = filepath
+            futures.append(future)
+
+        # После отправки всех задач обрабатываем результаты параллельно
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Processing downloaded archives"):
+            filepath = getattr(future, "filepath", "unknown")
             try:
                 samples = future.result(timeout=300)
+                m = regex.search(os.path.basename(filepath))
+                if m:
+                    date_str = m.group(1)
+                    pair = m.group(2)
+                    key = f"{pair}_{date_str}"
+                else:
+                    key = "unknown"
+                if samples:
+                    try:
+                        features_list = [s["features"] for s in samples]
+                        targets_list = [s["target"] for s in samples]
+                        X = np.stack(features_list)
+                        Y = np.array(targets_list)
+                        archive_id = os.path.splitext(os.path.basename(filepath))[0]
+                        output_path = os.path.join("data", f"{key}_{archive_id}.npz")
+                        np.savez_compressed(output_path, X=X, Y=Y)
+                        print(f"Saved {output_path}. Total samples: {X.shape[0]}")
+                    except Exception as e:
+                        print(f"Error saving {filepath}: {e}")
             except Exception as e:
                 print(f"Error processing {filepath}: {e}")
+            finally:
                 try:
                     os.remove(filepath)
                 except Exception as e:
                     print(f"Не удалось удалить файл {filepath}: {e}")
-                continue
-
-            m = regex.search(os.path.basename(filepath))
-            if m:
-                date_str = m.group(1)
-                pair = m.group(2)
-                key = f"{pair}_{date_str}"
-            else:
-                key = "unknown"
-            if samples:
-                try:
-                    features_list = [s["features"] for s in samples]
-                    targets_list = [s["target"] for s in samples]
-                    X = np.stack(features_list)
-                    Y = np.array(targets_list)
-                    # Формируем имя файла с уникальным идентификатором архива
-                    archive_id = os.path.splitext(os.path.basename(filepath))[0]
-                    output_path = os.path.join("data", f"{key}_{archive_id}.npz")
-                    np.savez_compressed(output_path, X=X, Y=Y)
-                    print(f"Saved {output_path}. Total samples: {X.shape[0]}")
-                except Exception as e:
-                    print(f"Error saving {filepath}: {e}")
-            try:
-                os.remove(filepath)
-            except Exception as e:
-                print(f"Не удалось удалить файл {filepath}: {e}")
 
     downloader_thread.join()
     print("Обработка завершена.")
