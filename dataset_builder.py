@@ -14,11 +14,29 @@ import json
 import zipfile
 from tqdm import tqdm
 
-from config import (
-    TRAINING_DATE_RANGES, URL_TEMPLATE, NUM_LEVELS, SEQUENCE_LENGTH,
-    HORIZON_MS, SYMBOLS, MAX_TARGET_CHANGE_PERCENT, CANDLE_INTERVAL_MIN, CANDLE_TOTAL_HOURS
-)
+# Параметры из config
+TRAINING_DATE_RANGES = [
+    "2024-05-01,2024-12-31",  # Bullish период
+    "2024-01-01,2024-04-30"   # Bearish период
+]
+URL_TEMPLATE = "https://quote-saver.bycsi.com/orderbook/linear/{pair}/{date}_{pair}_ob500.data.zip"
+SYMBOLS = [
+    "BTC/USDT", "ETH/USDT", "BNB/USDT", "ADA/USDT", "XRP/USDT",
+    "SOL/USDT", "DOT/USDT", "DOGE/USDT", "LTC/USDT", "MATIC/USDT"
+]
+NUM_LEVELS = 5
+SEQUENCE_LENGTH = 10
+HORIZON_MS = 10000  # 10 секунд
+MAX_TARGET_CHANGE_PERCENT = 0.2
 
+# Candle параметры (5 минут, 5 часов)
+CANDLE_INTERVAL_MIN = 5
+CANDLE_TOTAL_HOURS = 5
+CANDLE_FEATURES_PER_CANDLE = 2
+
+# -------------------------------
+# Функции расчёта признаков
+# -------------------------------
 def generate_date_urls(date_range, template):
     """Принимает строку "YYYY-MM-DD,YYYY-MM-DD" и возвращает список URL-ов."""
     start_str, end_str = date_range.split(',')
@@ -33,7 +51,7 @@ def generate_date_urls(date_range, template):
     return urls
 
 def open_zip(source):
-    """Открывает zip-архив по URL или по локальному пути."""
+    """Открывает zip-архив по URL или локальному пути."""
     if isinstance(source, str) and source.startswith("http"):
         try:
             r = requests.get(source)
@@ -52,7 +70,7 @@ def open_zip(source):
             return None
 
 def get_features_from_orderbook(ob, num_levels=NUM_LEVELS):
-    """Извлекает признаки из словаря orderbook (bid и ask уровни)."""
+    """Извлекает признаки из orderbook: для каждого уровня возвращает цену и размер."""
     features = []
     bids = sorted(ob.get('b', {}).items(), key=lambda x: x[0], reverse=True)
     for i in range(num_levels):
@@ -71,7 +89,7 @@ def get_features_from_orderbook(ob, num_levels=NUM_LEVELS):
     return features
 
 def get_mid_price(ob):
-    """Возвращает среднюю цену между лучшим бидом и лучшим аском."""
+    """Вычисляет среднюю цену между лучшим бидом и лучшим аском."""
     bids = sorted(ob.get('b', {}).items(), key=lambda x: x[0], reverse=True)
     asks = sorted(ob.get('a', {}).items(), key=lambda x: x[0])
     if not bids or not asks:
@@ -80,8 +98,8 @@ def get_mid_price(ob):
 
 def compute_candle_features(records, end_time):
     """
-    Группирует записи по 5-минутным интервалам за 5 часов (60 свечей)
-    и вычисляет для каждого интервала два признака: return и range.
+    Группирует записи по 5-минутным интервалам за последние 5 часов (60 свечей)
+    и для каждого интервала вычисляет два признака: return и range.
     """
     interval_ms = CANDLE_INTERVAL_MIN * 60 * 1000
     candle_count = int((CANDLE_TOTAL_HOURS * 60) / CANDLE_INTERVAL_MIN)
@@ -109,8 +127,8 @@ def compute_candle_features(records, end_time):
 
 def process_archive_file(filepath):
     """
-    Обрабатывает локальный zip-файл (архив) и возвращает список sample-словарей,
-    где каждый sample имеет ключи "features" (np.array) и "target" (np.float32).
+    Обрабатывает локальный zip-файл и возвращает список sample-словарей,
+    где каждый sample содержит "features" (np.array) и "target" (np.float32).
     """
     try:
         with open(filepath, "rb") as f:
@@ -214,12 +232,12 @@ def process_archive_file(filepath):
     return samples
 
 # ===============================
-# Продюсер и консьюмер
+# Продюсер и потребитель
 # ===============================
 def download_archive(url, zips_dir):
     """
     Скачивает архив по URL и сохраняет его в папку zips.
-    Возвращает путь к файлу или None при ошибке.
+    Возвращает путь к сохранённому файлу или None при ошибке.
     """
     try:
         response = requests.get(url)
@@ -270,21 +288,19 @@ def main():
             if filepath:
                 download_queue.put(filepath)
 
-    # Консьюмер: обрабатывает архивы из очереди
+    # Функция, которая обрабатывает архив (работает в отдельном процессе)
     def processor_worker(filepath):
         print(f"Начинаю обрабатывать архив {os.path.basename(filepath)}")
         return process_archive_file(filepath)
 
-    # Запускаем продюсера в отдельном потоке
     downloader_thread = threading.Thread(target=downloader)
     downloader_thread.start()
 
-    # Используем ProcessPoolExecutor для обработки архивов
     processed_results = []
     num_workers = os.cpu_count() or 4
     with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
         futures = []
-        # Пока продюсер работает или очередь не пуста, извлекаем файлы и отправляем задачи
+        # Пока продюсер работает или очередь не пуста, извлекаем файлы
         while downloader_thread.is_alive() or not download_queue.empty():
             try:
                 filepath = download_queue.get(timeout=1)
@@ -292,8 +308,7 @@ def main():
                 futures[-1].filepath = filepath
             except queue.Empty:
                 continue
-
-        # Обрабатываем результаты задач
+        # Обрабатываем результаты с прогресс-баром
         for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="Processing downloaded archives"):
             filepath = getattr(future, "filepath", "unknown")
             try:
@@ -317,5 +332,4 @@ def main():
     print(f"Dataset built and saved. Total samples: {total_samples}")
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
     main()
