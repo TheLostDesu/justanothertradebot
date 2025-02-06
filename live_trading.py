@@ -12,7 +12,7 @@ from config import (TIMEFRAME_SECONDS, NUM_LEVELS, SEQUENCE_LENGTH, MIN_SIGNAL_P
                     DEFAULT_TRAILING_STOP, ERROR_COOLDOWN_SECONDS, NEGATIVE_PERFORMANCE_COOLDOWN_SECONDS,
                     MIN_AVG_PROFIT_THRESHOLD, TOTAL_INPUT_DIM, RISK_PERCENTAGE, CONFIDENCE_SCALE, MAX_VOLATILITY_THRESHOLD)
 from bybit_ws import start_bybit_ws, get_orderbook
-from dataset import get_features_from_orderbook, get_mid_price
+from orderbook import get_features_from_orderbook, get_mid_price
 from bybit_api import fetch_balance, create_order, fetch_candles
 
 logging.basicConfig(level=logging.INFO)
@@ -55,10 +55,10 @@ async def trade_symbol(symbol, model, device):
     global error_cooldown_until, position_history
     position = None
     last_trade_time = 0
-    lob_buffer = []  # Flattened LOB data
+    lob_buffer = []  # Накопленный LOB в виде плоского списка
     daily_profit = 0.0
     current_day = time.strftime("%Y-%m-%d", time.localtime())
-    
+
     def check_performance():
         if len(position_history) >= 3:
             recent = position_history[-3:]
@@ -123,9 +123,10 @@ async def trade_symbol(symbol, model, device):
 
                 lob_features = get_features_from_orderbook(orderbook, NUM_LEVELS)
                 lob_buffer.extend(lob_features)
-                if len(lob_buffer) > SEQUENCE_LENGTH * (NUM_LEVELS * 4):
-                    lob_buffer = lob_buffer[-(SEQUENCE_LENGTH * (NUM_LEVELS * 4)):]
-                if len(lob_buffer) < SEQUENCE_LENGTH * (NUM_LEVELS * 4):
+                max_buffer_length = SEQUENCE_LENGTH * (NUM_LEVELS * 4)
+                if len(lob_buffer) > max_buffer_length:
+                    lob_buffer = lob_buffer[-max_buffer_length:]
+                if len(lob_buffer) < max_buffer_length:
                     logging.info(f"[{symbol}] Accumulating LOB data...")
                     await asyncio.sleep(TIMEFRAME_SECONDS)
                     continue
@@ -136,7 +137,7 @@ async def trade_symbol(symbol, model, device):
                 with torch.no_grad():
                     predicted_delta_pct = model(inp).item()
                 logging.info(f"[{symbol}] Predicted percentage change: {predicted_delta_pct*100:.2f}%")
-                
+
                 orderbook = get_orderbook(symbol)
                 if orderbook is None:
                     await asyncio.sleep(TIMEFRAME_SECONDS)
@@ -188,14 +189,13 @@ async def trade_symbol(symbol, model, device):
                         last_trade_time = time.time()
                 else:
                     logging.info(f"[{symbol}] No clear trading signal.")
-                
+
                 await asyncio.sleep(TIMEFRAME_SECONDS)
             except Exception as e:
                 logging.error(f"[{symbol}] Error in main loop: {e}")
-                global error_cooldown_until
                 error_cooldown_until = time.time() + ERROR_COOLDOWN_SECONDS
                 await asyncio.sleep(TIMEFRAME_SECONDS)
-                
+
 async def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = CombinedModel(input_dim=TOTAL_INPUT_DIM)
@@ -208,12 +208,12 @@ async def main():
     model.to(device)
     model.eval()
     logging.info("Model loaded successfully.")
-    
+
     async with aiohttp.ClientSession() as session:
         ws_task = asyncio.create_task(start_bybit_ws())
         tasks = [trade_symbol(symbol, model, device) for symbol in SYMBOLS]
         await asyncio.gather(*tasks)
-        await ws_task
+        await ws_task()
 
 if __name__ == '__main__':
     """

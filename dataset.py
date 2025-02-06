@@ -6,6 +6,7 @@ import pickle
 import re
 import threading
 import queue
+import time
 from datetime import datetime, timedelta
 import numpy as np
 import requests
@@ -13,32 +14,13 @@ import io
 import json
 import zipfile
 from tqdm import tqdm
+from orderbook import OrderBookSide, get_features_from_orderbook, get_mid_price
+from config import (TRAINING_DATE_RANGES, URL_TEMPLATE, SYMBOLS, NUM_LEVELS,
+                    SEQUENCE_LENGTH, HORIZON_MS, MAX_TARGET_CHANGE_PERCENT,
+                    CANDLE_INTERVAL_MIN, CANDLE_TOTAL_HOURS)
 
-# Параметры из config
-TRAINING_DATE_RANGES = [
-    "2024-05-01,2024-12-31",  # Bullish период
-    "2024-01-01,2024-04-30"   # Bearish период
-]
-URL_TEMPLATE = "https://quote-saver.bycsi.com/orderbook/linear/{pair}/{date}_{pair}_ob500.data.zip"
-SYMBOLS = [
-    "BTC/USDT", "ETH/USDT", "BNB/USDT", "ADA/USDT", "XRP/USDT",
-    "SOL/USDT", "DOT/USDT", "DOGE/USDT", "LTC/USDT", "MATIC/USDT"
-]
-NUM_LEVELS = 5
-SEQUENCE_LENGTH = 10
-HORIZON_MS = 10000  # 10 секунд
-MAX_TARGET_CHANGE_PERCENT = 0.2
-
-# Candle параметры (5 минут, 5 часов)
-CANDLE_INTERVAL_MIN = 5
-CANDLE_TOTAL_HOURS = 5
-CANDLE_FEATURES_PER_CANDLE = 2
-
-# -------------------------------
-# Функции расчёта признаков
-# -------------------------------
 def generate_date_urls(date_range, template):
-    """Принимает строку "YYYY-MM-DD,YYYY-MM-DD" и возвращает список URL-ов."""
+    """Принимает строку 'YYYY-MM-DD,YYYY-MM-DD' и возвращает список URL-ов."""
     start_str, end_str = date_range.split(',')
     start_date = datetime.strptime(start_str.strip(), "%Y-%m-%d")
     end_date = datetime.strptime(end_str.strip(), "%Y-%m-%d")
@@ -68,33 +50,6 @@ def open_zip(source):
         except Exception as e:
             print(f"Error opening zip file {source}: {e}")
             return None
-
-def get_features_from_orderbook(ob, num_levels=NUM_LEVELS):
-    """Извлекает признаки из orderbook: для каждого уровня возвращает цену и размер."""
-    features = []
-    bids = sorted(ob.get('b', {}).items(), key=lambda x: x[0], reverse=True)
-    for i in range(num_levels):
-        if i < len(bids):
-            price, size = bids[i]
-            features.extend([price, size])
-        else:
-            features.extend([0.0, 0.0])
-    asks = sorted(ob.get('a', {}).items(), key=lambda x: x[0])
-    for i in range(num_levels):
-        if i < len(asks):
-            price, size = asks[i]
-            features.extend([price, size])
-        else:
-            features.extend([0.0, 0.0])
-    return features
-
-def get_mid_price(ob):
-    """Вычисляет среднюю цену между лучшим бидом и лучшим аском."""
-    bids = sorted(ob.get('b', {}).items(), key=lambda x: x[0], reverse=True)
-    asks = sorted(ob.get('a', {}).items(), key=lambda x: x[0])
-    if not bids or not asks:
-        return None
-    return (bids[0][0] + asks[0][0]) / 2.0
 
 def compute_candle_features(records, end_time):
     """
@@ -129,6 +84,7 @@ def process_archive_file(filepath):
     """
     Обрабатывает локальный zip-файл и возвращает список sample-словарей,
     где каждый sample содержит "features" (np.array) и "target" (np.float32).
+    Orderbook хранится с использованием OrderBookSide для эффективного обновления.
     """
     try:
         with open(filepath, "rb") as f:
@@ -153,13 +109,16 @@ def process_archive_file(filepath):
                 data = record.get('data', {})
                 r_type = record.get('type')
                 if r_type == 'snapshot' or data.get('u') == 1:
-                    current_ob = {'a': {}, 'b': {}}
+                    current_ob = {
+                        'a': OrderBookSide(is_bid=False),
+                        'b': OrderBookSide(is_bid=True)
+                    }
                     if 'a' in data:
                         for level in data['a']:
                             try:
                                 price = float(level[0])
                                 size = float(level[1])
-                                current_ob['a'][price] = size
+                                current_ob['a'].update(price, size)
                             except Exception:
                                 continue
                     if 'b' in data:
@@ -167,7 +126,7 @@ def process_archive_file(filepath):
                             try:
                                 price = float(level[0])
                                 size = float(level[1])
-                                current_ob['b'][price] = size
+                                current_ob['b'].update(price, size)
                             except Exception:
                                 continue
                 elif r_type == 'delta':
@@ -181,19 +140,20 @@ def process_archive_file(filepath):
                                     size = float(update[1])
                                 except Exception:
                                     continue
-                                if size == 0.0:
-                                    if price in current_ob[side]:
-                                        del current_ob[side][price]
-                                else:
-                                    current_ob[side][price] = size
+                                current_ob[side].update(price, size)
                 else:
                     continue
                 if current_ob is None:
                     continue
-                mid = get_mid_price(current_ob)
+                # Преобразуем OrderBookSide в обычные списки для дальнейшей обработки.
+                ob_lists = {
+                    'a': current_ob['a'].get_list(),
+                    'b': current_ob['b'].get_list()
+                }
+                mid = get_mid_price(ob_lists)
                 if mid is None:
                     continue
-                feats = get_features_from_orderbook(current_ob, NUM_LEVELS)
+                feats = get_features_from_orderbook(ob_lists, NUM_LEVELS)
                 ts = record.get('ts')
                 try:
                     ts = int(ts)
@@ -231,9 +191,6 @@ def process_archive_file(filepath):
         })
     return samples
 
-# ===============================
-# Продюсер и потребитель
-# ===============================
 def download_archive(url, zips_dir):
     """
     Скачивает архив по URL и сохраняет его в папку zips.
@@ -250,14 +207,11 @@ def download_archive(url, zips_dir):
     except Exception as e:
         print(f"Error downloading {url}: {e}")
         return None
-# Функция, которая обрабатывает архив (работает в отдельном процессе)
+
 def processor_worker(filepath):
     print(f"Начинаю обрабатывать архив {os.path.basename(filepath)}")
     return process_archive_file(filepath)
 
-# ===============================
-# Основной блок
-# ===============================
 def build_dataset_for_pairs(selected_pairs):
     all_urls = []
     for dr in TRAINING_DATE_RANGES:
@@ -285,30 +239,30 @@ def main():
 
     download_queue = queue.Queue()
 
-    # Продюсер: скачивает архивы и кладёт их в очередь
     def downloader():
         for url in tqdm(all_urls, desc="Downloading archives"):
+            while download_queue.qsize() >= 100:
+                time.sleep(0.1)
             filepath = download_archive(url, "zips")
             if filepath:
                 download_queue.put(filepath)
-
 
     downloader_thread = threading.Thread(target=downloader)
     downloader_thread.start()
 
     processed_results = []
     num_workers = os.cpu_count() or 4
+    futures = []
     with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
-        futures = []
-        # Пока продюсер работает или очередь не пуста, извлекаем файлы
         while downloader_thread.is_alive() or not download_queue.empty():
             try:
                 filepath = download_queue.get(timeout=1)
-                futures.append(executor.submit(processor_worker, filepath))
-                futures[-1].filepath = filepath
+                fut = executor.submit(processor_worker, filepath)
+                fut.filepath = filepath
+                futures.append(fut)
             except queue.Empty:
                 continue
-        # Обрабатываем результаты с прогресс-баром
+
         for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="Processing downloaded archives"):
             filepath = getattr(future, "filepath", "unknown")
             try:
@@ -326,6 +280,11 @@ def main():
                 processed_results.append((filepath, len(samples)))
             except Exception as e:
                 print(f"Error processing {filepath}: {e}")
+            finally:
+                try:
+                    os.remove(filepath)
+                except Exception as e:
+                    print(f"Не удалось удалить файл {filepath}: {e}")
 
     downloader_thread.join()
     total_samples = sum(s for _, s in processed_results)

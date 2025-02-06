@@ -4,7 +4,10 @@ import json
 import websockets
 import logging
 from config import WS_API_URL, SYMBOLS
+from orderbook import OrderBookSide
 
+# Глобальный словарь для хранения orderbook для каждого символа.
+# Для каждого символа хранится словарь с двумя сторонами: 'a' (asks) и 'b' (bids).
 orderbooks = {}
 
 async def subscribe_orderbook(ws, symbol):
@@ -17,10 +20,14 @@ async def subscribe_orderbook(ws, symbol):
 async def bybit_ws_client():
     global orderbooks
     async with websockets.connect(WS_API_URL) as ws:
+        # Подписываемся на каналы и инициализируем пустые orderbook'и.
         for symbol in SYMBOLS:
             await subscribe_orderbook(ws, symbol)
             symbol_formatted = symbol.replace("/", "")
-            orderbooks[symbol_formatted] = {"a": {}, "b": {}}
+            orderbooks[symbol_formatted] = {
+                "a": OrderBookSide(is_bid=False),
+                "b": OrderBookSide(is_bid=True)
+            }
         while True:
             try:
                 msg = await ws.recv()
@@ -30,16 +37,24 @@ async def bybit_ws_client():
                     symbol_formatted = topic.split(".")[1]
                     if "data" in data:
                         orders = data["data"]
-                        ob = {"a": {}, "b": {}}
+                        ob = orderbooks.get(symbol_formatted)
+                        if ob is None:
+                            ob = {
+                                "a": OrderBookSide(is_bid=False),
+                                "b": OrderBookSide(is_bid=True)
+                            }
+                            orderbooks[symbol_formatted] = ob
                         for order in orders:
-                            price = float(order["price"])
-                            size = float(order["size"])
+                            try:
+                                price = float(order["price"])
+                                size = float(order["size"])
+                            except Exception:
+                                continue
                             side = order["side"].lower()
                             if side == "buy":
-                                ob["b"][price] = size
+                                ob["b"].update(price, size)
                             elif side == "sell":
-                                ob["a"][price] = size
-                        orderbooks[symbol_formatted] = ob
+                                ob["a"].update(price, size)
                         logging.info(f"Updated orderbook for {symbol_formatted}")
             except Exception as e:
                 logging.error(f"Error in WebSocket client: {e}")
@@ -49,5 +64,12 @@ async def start_bybit_ws():
     await bybit_ws_client()
 
 def get_orderbook(symbol):
+    """
+    Возвращает orderbook для символа в виде словаря с ключами 'a' и 'b',
+    где каждая сторона — обычный список кортежей (sort_key, price, size).
+    """
     symbol_formatted = symbol.replace("/", "")
-    return orderbooks.get(symbol_formatted, None)
+    ob = orderbooks.get(symbol_formatted)
+    if ob is None:
+        return None
+    return {"a": ob["a"].get_list(), "b": ob["b"].get_list()}
