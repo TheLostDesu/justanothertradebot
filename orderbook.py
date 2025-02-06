@@ -18,10 +18,11 @@ class OrderBookSide:
         key = -price if self.is_bid else price
         idx = self.sl.bisect_left((key, price, 0.0))
         if idx < len(self.sl) and self.sl[idx][1] == price:
-            if size == 0.0:
-                self.sl.pop(idx)
-            else:
-                self.sl[idx] = (key, price, size)
+            # Сначала удаляем существующий элемент
+            del self.sl[idx]
+            # Если новый размер не равен нулю, добавляем обновлённое значение
+            if size != 0.0:
+                self.sl.add((key, price, size))
         else:
             if size != 0.0:
                 self.sl.add((key, price, size))
