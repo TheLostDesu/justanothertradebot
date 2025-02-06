@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
 import argparse
-import threading
-import queue
+import concurrent.futures
 import os
 import pickle
 import re
+import threading
 from tqdm import tqdm
 import requests
 import io
 import json
 import zipfile
-import numpy as np
+import queue
 
-# Импортируем функцию генерации URL-ов из диапазона дат
+# Импортируем функцию генерации URL-ов
 from dataset import generate_date_urls
 from config import TRAINING_DATE_RANGES, URL_TEMPLATE, NUM_LEVELS, SEQUENCE_LENGTH, HORIZON_MS, SYMBOLS
 
-# --- Функция скачивания архива ---
+# -----------------------------
+# Функция скачивания архива (I/O-bound)
+# -----------------------------
 def download_archive(url, zips_dir):
     """
     Скачивает архив по URL и сохраняет его в папку zips.
@@ -34,12 +36,13 @@ def download_archive(url, zips_dir):
         print(f"Error downloading {url}: {e}")
         return None
 
-# --- Функция обработки локального архива ---
+# -----------------------------
+# Функция обработки локального архива (CPU-bound)
+# -----------------------------
 def process_archive_file(filepath):
     """
-    Обрабатывает локальный zip-файл и возвращает список sample-словарей.
-    Каждый sample имеет ключи:
-      "features": np.array(...), "target": np.float32(...)
+    Обрабатывает локальный zip-файл (архив) и возвращает список sample-словарей.
+    Каждый sample – dict с ключами "features" (np.array) и "target" (np.float32).
     """
     try:
         with open(filepath, "rb") as f:
@@ -52,7 +55,7 @@ def process_archive_file(filepath):
     except Exception as e:
         print(f"Error opening zip file {filepath}: {e}")
         return []
-    # Импортируем необходимые функции из dataset.py
+    # Импорт необходимых функций из dataset.py
     from dataset import get_features_from_orderbook, get_mid_price, compute_candle_features
     records = []
     current_ob = None
@@ -145,43 +148,9 @@ def process_archive_file(filepath):
         })
     return samples
 
-# --- Продюсер: скачивает архивы и кладёт их в очередь ---
-def downloader(all_urls, zips_dir, download_queue):
-    for url in tqdm(all_urls, desc="Downloading archives"):
-        filepath = download_archive(url, zips_dir)
-        if filepath:
-            download_queue.put(filepath)
-
-# --- Консьюмер: обрабатывает архивы из очереди и сохраняет результат ---
-def processor(download_queue):
-    while True:
-        try:
-            filepath = download_queue.get(timeout=10)
-        except queue.Empty:
-            break
-        samples = process_archive_file(filepath)
-        # Извлекаем дату и пару из имени файла
-        m = re.search(r"(\d{4}-\d{2}-\d{2})_([A-Z]+)_ob500\.data\.zip", os.path.basename(filepath))
-        if m:
-            date_str = m.group(1)
-            pair = m.group(2)
-        else:
-            date_str = "unknown"
-            pair = "unknown"
-        out_filename = f"data/{pair}_{date_str}.pkl"
-        with open(out_filename, "wb") as f:
-            pickle.dump({"samples": samples}, f)
-        download_queue.task_done()
-
-def build_dataset_for_pairs(selected_pairs):
-    all_urls = []
-    for dr in TRAINING_DATE_RANGES:
-        for sym in selected_pairs:
-            pair = sym.replace("/", "")
-            urls = generate_date_urls(dr, URL_TEMPLATE.replace("{pair}", pair))
-            all_urls.extend(urls)
-    return all_urls
-
+# -----------------------------
+# Основной блок: загрузка и обработка архивов
+# -----------------------------
 def main():
     parser = argparse.ArgumentParser(description="Dataset builder for trade bot.")
     parser.add_argument("--pair-index", type=int, default=None,
@@ -193,30 +162,79 @@ def main():
     else:
         selected_pairs = SYMBOLS
 
-    all_urls = build_dataset_for_pairs(selected_pairs)
+    # Собираем список URL архивов для выбранных пар
+    all_urls = []
+    for dr in TRAINING_DATE_RANGES:
+        for sym in selected_pairs:
+            pair = sym.replace("/", "")
+            urls = generate_date_urls(dr, URL_TEMPLATE.replace("{pair}", pair))
+            all_urls.extend(urls)
     print(f"Total archives to process: {len(all_urls)}")
+
+    # Создаем директории для хранения архивов и обработанных данных
     os.makedirs("zips", exist_ok=True)
     os.makedirs("data", exist_ok=True)
 
+    # Очередь для передачи путей скачанных архивов
     download_queue = queue.Queue()
 
-    # Запускаем продюсер, который скачивает архивы
-    downloader_thread = threading.Thread(target=downloader, args=(all_urls, "zips", download_queue))
+    # -----------------------------
+    # Продюсер: скачивает архивы
+    # -----------------------------
+    def downloader():
+        for url in tqdm(all_urls, desc="Downloading archives"):
+            filepath = download_archive(url, "zips")
+            if filepath:
+                download_queue.put(filepath)
+
+    # -----------------------------
+    # Консьюмер: обрабатывает архивы из очереди (используем ProcessPoolExecutor)
+    # -----------------------------
+    def processor(filepath):
+        # Логируем начало обработки архива
+        print(f"Начинаю обрабатывать архив {os.path.basename(filepath)}")
+        return process_archive_file(filepath)
+
+    # Запускаем поток для скачивания архивов
+    downloader_thread = threading.Thread(target=downloader)
     downloader_thread.start()
 
-    # Запускаем несколько воркеров для обработки скачанных архивов
-    processor_threads = []
-    for _ in range(4):
-        t = threading.Thread(target=processor, args=(download_queue,))
-        t.start()
-        processor_threads.append(t)
+    # Используем ProcessPoolExecutor для параллельной обработки архивов
+    processed_results = []
+    with concurrent.futures.ProcessPoolExecutor() as process_executor:
+        futures = []
+        # Пока поток скачивания работает или очередь не пуста, извлекаем файлы и отправляем на обработку
+        while downloader_thread.is_alive() or not download_queue.empty():
+            try:
+                filepath = download_queue.get(timeout=1)
+                future = process_executor.submit(processor, filepath)
+                futures.append((filepath, future))
+            except queue.Empty:
+                continue
+
+        # Дожидаемся завершения всех задач
+        for filepath, future in tqdm(futures, desc="Processing downloaded archives"):
+            try:
+                samples = future.result()
+                # Извлекаем дату и пару из имени файла
+                m = re.search(r"(\d{4}-\d{2}-\d{2})_([A-Z]+)_ob500\.data\.zip", os.path.basename(filepath))
+                if m:
+                    date_str = m.group(1)
+                    pair = m.group(2)
+                else:
+                    date_str = "unknown"
+                    pair = "unknown"
+                out_filename = f"data/{pair}_{date_str}.pkl"
+                with open(out_filename, "wb") as f:
+                    pickle.dump({"samples": samples}, f)
+                processed_results.append((filepath, len(samples)))
+            except Exception as e:
+                print(f"Error processing {filepath}: {e}")
 
     downloader_thread.join()
-    download_queue.join()
-    for t in processor_threads:
-        t.join()
-
-    print("All archives processed.")
+    total_samples = sum(s for _, s in processed_results)
+    print(f"Dataset built and saved. Total samples: {total_samples}")
 
 if __name__ == '__main__':
+    import argparse, threading, queue, os, pickle, re
     main()
