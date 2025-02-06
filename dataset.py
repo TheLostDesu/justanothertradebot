@@ -2,7 +2,6 @@
 import argparse
 import concurrent.futures
 import os
-import pickle
 import re
 import threading
 import queue
@@ -249,7 +248,7 @@ def main():
 
     download_queue = queue.Queue()
 
-    # Сохраняем архивы не более чем 100 файлов вперед.
+    # Ограничение очереди до 100 архивов
     def downloader():
         for url in tqdm(all_urls, desc="Downloading archives"):
             while download_queue.qsize() >= 100:
@@ -261,65 +260,53 @@ def main():
     downloader_thread = threading.Thread(target=downloader)
     downloader_thread.start()
 
-    # Словарь для накопления сэмплов по дням (или комбинации "пара_дата").
-    daily_samples = {}
-
+    # Обработка архивов: по завершении обработки каждого архива сразу сохраняем NPZ-файл
+    regex = re.compile(r"(\d{4}-\d{2}-\d{2})_([A-Z]+)_ob500\.data\.zip")
     num_workers = os.cpu_count() or 4
-    futures = []
     with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
         while downloader_thread.is_alive() or not download_queue.empty():
             try:
                 filepath = download_queue.get(timeout=1)
-                fut = executor.submit(processor_worker, filepath)
-                fut.filepath = filepath
-                futures.append(fut)
             except queue.Empty:
                 continue
-
-        # Для каждого обработанного архива определяем дату (и пару) по имени файла
-        # и группируем сэмплы в daily_samples.
-        regex = re.compile(r"(\d{4}-\d{2}-\d{2})_([A-Z]+)_ob500\.data\.zip")
-        for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures),
-                               desc="Processing downloaded archives"):
-            filepath = getattr(future, "filepath", "unknown")
+            future = executor.submit(processor_worker, filepath)
             try:
-                samples = future.result()
-                m = regex.search(os.path.basename(filepath))
-                if m:
-                    date_str = m.group(1)
-                    pair = m.group(2)
-                    key = f"{pair}_{date_str}"
-                else:
-                    key = "unknown"
-                if key not in daily_samples:
-                    daily_samples[key] = []
-                daily_samples[key].extend(samples)
+                samples = future.result(timeout=300)
             except Exception as e:
                 print(f"Error processing {filepath}: {e}")
-            finally:
                 try:
                     os.remove(filepath)
                 except Exception as e:
                     print(f"Не удалось удалить файл {filepath}: {e}")
+                continue
+
+            m = regex.search(os.path.basename(filepath))
+            if m:
+                date_str = m.group(1)
+                pair = m.group(2)
+                key = f"{pair}_{date_str}"
+            else:
+                key = "unknown"
+            if samples:
+                try:
+                    features_list = [s["features"] for s in samples]
+                    targets_list = [s["target"] for s in samples]
+                    X = np.stack(features_list)
+                    Y = np.array(targets_list)
+                    # Формируем имя файла с уникальным идентификатором архива
+                    archive_id = os.path.splitext(os.path.basename(filepath))[0]
+                    output_path = os.path.join("data", f"{key}_{archive_id}.npz")
+                    np.savez_compressed(output_path, X=X, Y=Y)
+                    print(f"Saved {output_path}. Total samples: {X.shape[0]}")
+                except Exception as e:
+                    print(f"Error saving {filepath}: {e}")
+            try:
+                os.remove(filepath)
+            except Exception as e:
+                print(f"Не удалось удалить файл {filepath}: {e}")
 
     downloader_thread.join()
-
-    # Для каждого ключа (пара_дата) сохраняем отдельный NPZ-файл.
-    for key, samples in daily_samples.items():
-        if samples:
-            features_list = [sample["features"] for sample in samples]
-            targets_list = [sample["target"] for sample in samples]
-            try:
-                X = np.stack(features_list)  # shape: (n_samples, feature_dim)
-            except Exception as e:
-                print(f"Error stacking features for {key}: {e}")
-                continue
-            Y = np.array(targets_list)   # shape: (n_samples,)
-            output_path = os.path.join("data", f"{key}.npz")
-            np.savez_compressed(output_path, X=X, Y=Y)
-            print(f"Saved dataset for {key} to {output_path}. Total samples: {X.shape[0]}")
-        else:
-            print(f"No samples for {key}.")
+    print("Обработка завершена.")
 
 if __name__ == '__main__':
     main()
