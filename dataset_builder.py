@@ -250,6 +250,10 @@ def download_archive(url, zips_dir):
     except Exception as e:
         print(f"Error downloading {url}: {e}")
         return None
+# Функция, которая обрабатывает архив (работает в отдельном процессе)
+def processor_worker(filepath):
+    print(f"Начинаю обрабатывать архив {os.path.basename(filepath)}")
+    return process_archive_file(filepath)
 
 # ===============================
 # Основной блок
@@ -288,10 +292,6 @@ def main():
             if filepath:
                 download_queue.put(filepath)
 
-    # Функция, которая обрабатывает архив (работает в отдельном процессе)
-    def processor_worker(filepath):
-        print(f"Начинаю обрабатывать архив {os.path.basename(filepath)}")
-        return process_archive_file(filepath)
 
     downloader_thread = threading.Thread(target=downloader)
     downloader_thread.start()
