@@ -7,48 +7,110 @@ import re
 import threading
 import queue
 from datetime import datetime, timedelta
-
+import numpy as np
 import requests
 import io
 import json
 import zipfile
 from tqdm import tqdm
 
-# Импорт параметров и функции генерации URL-ов
 from config import (
     TRAINING_DATE_RANGES, URL_TEMPLATE, NUM_LEVELS, SEQUENCE_LENGTH,
-    HORIZON_MS, SYMBOLS, MAX_TARGET_CHANGE_PERCENT
+    HORIZON_MS, SYMBOLS, MAX_TARGET_CHANGE_PERCENT, CANDLE_INTERVAL_MIN, CANDLE_TOTAL_HOURS
 )
-from dataset import generate_date_urls
 
-# ===============================
-# Функция скачивания архива (I/O-bound)
-# ===============================
-def download_archive(url, zips_dir):
-    """
-    Скачивает архив по URL и сохраняет его в папку zips.
-    Возвращает полный путь к сохранённому файлу или None при ошибке.
-    """
-    try:
-        response = requests.get(url)
-        response.raise_for_status()
-        filename = url.split("/")[-1]
-        filepath = os.path.join(zips_dir, filename)
-        with open(filepath, "wb") as f:
-            f.write(response.content)
-        return filepath
-    except Exception as e:
-        print(f"Error downloading {url}: {e}")
+def generate_date_urls(date_range, template):
+    """Принимает строку "YYYY-MM-DD,YYYY-MM-DD" и возвращает список URL-ов."""
+    start_str, end_str = date_range.split(',')
+    start_date = datetime.strptime(start_str.strip(), "%Y-%m-%d")
+    end_date = datetime.strptime(end_str.strip(), "%Y-%m-%d")
+    urls = []
+    current_date = start_date
+    while current_date <= end_date:
+        date_str = current_date.strftime("%Y-%m-%d")
+        urls.append(template.format(pair="BTCUSDT", date=date_str))
+        current_date += timedelta(days=1)
+    return urls
+
+def open_zip(source):
+    """Открывает zip-архив по URL или по локальному пути."""
+    if isinstance(source, str) and source.startswith("http"):
+        try:
+            r = requests.get(source)
+            r.raise_for_status()
+            return zipfile.ZipFile(io.BytesIO(r.content))
+        except Exception as e:
+            print(f"Error downloading {source}: {e}")
+            return None
+    else:
+        try:
+            with open(source, "rb") as f:
+                content = f.read()
+            return zipfile.ZipFile(io.BytesIO(content))
+        except Exception as e:
+            print(f"Error opening zip file {source}: {e}")
+            return None
+
+def get_features_from_orderbook(ob, num_levels=NUM_LEVELS):
+    """Извлекает признаки из словаря orderbook (bid и ask уровни)."""
+    features = []
+    bids = sorted(ob.get('b', {}).items(), key=lambda x: x[0], reverse=True)
+    for i in range(num_levels):
+        if i < len(bids):
+            price, size = bids[i]
+            features.extend([price, size])
+        else:
+            features.extend([0.0, 0.0])
+    asks = sorted(ob.get('a', {}).items(), key=lambda x: x[0])
+    for i in range(num_levels):
+        if i < len(asks):
+            price, size = asks[i]
+            features.extend([price, size])
+        else:
+            features.extend([0.0, 0.0])
+    return features
+
+def get_mid_price(ob):
+    """Возвращает среднюю цену между лучшим бидом и лучшим аском."""
+    bids = sorted(ob.get('b', {}).items(), key=lambda x: x[0], reverse=True)
+    asks = sorted(ob.get('a', {}).items(), key=lambda x: x[0])
+    if not bids or not asks:
         return None
+    return (bids[0][0] + asks[0][0]) / 2.0
 
-# ===============================
-# Функция обработки локального архива (CPU-bound)
-# ===============================
+def compute_candle_features(records, end_time):
+    """
+    Группирует записи по 5-минутным интервалам за 5 часов (60 свечей)
+    и вычисляет для каждого интервала два признака: return и range.
+    """
+    interval_ms = CANDLE_INTERVAL_MIN * 60 * 1000
+    candle_count = int((CANDLE_TOTAL_HOURS * 60) / CANDLE_INTERVAL_MIN)
+    start_time = end_time - (CANDLE_TOTAL_HOURS * 60 * 1000)
+    buckets = [[] for _ in range(candle_count)]
+    for rec in records:
+        ts = rec["ts"]
+        if start_time <= ts < end_time:
+            bucket_index = int((ts - start_time) // interval_ms)
+            if bucket_index < candle_count:
+                buckets[bucket_index].append(rec["mid_price"])
+    features = []
+    for bucket in buckets:
+        if bucket:
+            open_price = bucket[0]
+            close_price = bucket[-1]
+            high = max(bucket)
+            low = min(bucket)
+            ret = (close_price - open_price) / open_price if open_price != 0 else 0
+            rng = (high - low) / open_price if open_price != 0 else 0
+        else:
+            ret, rng = 0, 0
+        features.extend([ret, rng])
+    return features
+
 def process_archive_file(filepath):
     """
-    Обрабатывает локальный zip-файл по указанному пути.
-    Возвращает список sample-словарей, где каждый sample содержит:
-      "features": np.array(...), "target": np.float32(...)
+    Обрабатывает локальный zip-файл (архив) и возвращает список sample-словарей,
+    где каждый sample имеет ключи "features" (np.array) и "target" (np.float32).
     """
     try:
         with open(filepath, "rb") as f:
@@ -61,8 +123,6 @@ def process_archive_file(filepath):
     except Exception as e:
         print(f"Error opening zip file {filepath}: {e}")
         return []
-    # Импорт необходимых функций из dataset (локально)
-    from dataset import get_features_from_orderbook, get_mid_price, compute_candle_features
     records = []
     current_ob = None
     for file_name in zf.namelist():
@@ -154,8 +214,37 @@ def process_archive_file(filepath):
     return samples
 
 # ===============================
-# Основной блок: продюсер и обработка архивов
+# Продюсер и консьюмер
 # ===============================
+def download_archive(url, zips_dir):
+    """
+    Скачивает архив по URL и сохраняет его в папку zips.
+    Возвращает путь к файлу или None при ошибке.
+    """
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        filename = url.split("/")[-1]
+        filepath = os.path.join(zips_dir, filename)
+        with open(filepath, "wb") as f:
+            f.write(response.content)
+        return filepath
+    except Exception as e:
+        print(f"Error downloading {url}: {e}")
+        return None
+
+# ===============================
+# Основной блок
+# ===============================
+def build_dataset_for_pairs(selected_pairs):
+    all_urls = []
+    for dr in TRAINING_DATE_RANGES:
+        for sym in selected_pairs:
+            pair = sym.replace("/", "")
+            urls = generate_date_urls(dr, URL_TEMPLATE.replace("{pair}", pair))
+            all_urls.extend(urls)
+    return all_urls
+
 def main():
     parser = argparse.ArgumentParser(description="Dataset builder for trade bot.")
     parser.add_argument("--pair-index", type=int, default=None,
@@ -167,49 +256,45 @@ def main():
     else:
         selected_pairs = SYMBOLS
 
-    # Собираем список URL для выбранных пар
-    all_urls = []
-    for dr in TRAINING_DATE_RANGES:
-        for sym in selected_pairs:
-            pair = sym.replace("/", "")
-            urls = generate_date_urls(dr, URL_TEMPLATE.replace("{pair}", pair))
-            all_urls.extend(urls)
+    all_urls = build_dataset_for_pairs(selected_pairs)
     print(f"Total archives to process: {len(all_urls)}")
-
-    # Создаем директории для сохранения архивов и результатов
     os.makedirs("zips", exist_ok=True)
     os.makedirs("data", exist_ok=True)
 
-    # Очередь для передачи путей скачанных архивов
     download_queue = queue.Queue()
 
-    # Продюсер: скачивает архивы и кладет их в очередь
+    # Продюсер: скачивает архивы и кладёт их в очередь
     def downloader():
         for url in tqdm(all_urls, desc="Downloading archives"):
             filepath = download_archive(url, "zips")
             if filepath:
                 download_queue.put(filepath)
 
+    # Консьюмер: обрабатывает архивы из очереди
+    def processor_worker(filepath):
+        print(f"Начинаю обрабатывать архив {os.path.basename(filepath)}")
+        return process_archive_file(filepath)
+
     # Запускаем продюсера в отдельном потоке
     downloader_thread = threading.Thread(target=downloader)
     downloader_thread.start()
 
-    # Используем ProcessPoolExecutor для параллельной обработки архивов по мере их поступления
-    processed_futures = []
+    # Используем ProcessPoolExecutor для обработки архивов
+    processed_results = []
     num_workers = os.cpu_count() or 4
     with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
-        # Пока продюсер работает или очередь не пуста, отправляем задачи на обработку
+        futures = []
+        # Пока продюсер работает или очередь не пуста, извлекаем файлы и отправляем задачи
         while downloader_thread.is_alive() or not download_queue.empty():
             try:
                 filepath = download_queue.get(timeout=1)
-                # Отправляем задачу на обработку архива
-                future = executor.submit(process_archive_file, filepath)
-                future.filepath = filepath  # прикрепляем имя файла для логов
-                processed_futures.append(future)
+                futures.append(executor.submit(processor_worker, filepath))
+                futures[-1].filepath = filepath
             except queue.Empty:
                 continue
-        # Ждем завершения всех задач и сохраняем результаты
-        for future in tqdm(concurrent.futures.as_completed(processed_futures), total=len(processed_futures), desc="Processing archives"):
+
+        # Обрабатываем результаты задач
+        for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="Processing downloaded archives"):
             filepath = getattr(future, "filepath", "unknown")
             try:
                 samples = future.result()
@@ -223,13 +308,14 @@ def main():
                 out_filename = f"data/{pair}_{date_str}.pkl"
                 with open(out_filename, "wb") as f:
                     pickle.dump({"samples": samples}, f)
+                processed_results.append((filepath, len(samples)))
             except Exception as e:
                 print(f"Error processing {filepath}: {e}")
 
     downloader_thread.join()
-    print("All archives processed.")
+    total_samples = sum(s for _, s in processed_results)
+    print(f"Dataset built and saved. Total samples: {total_samples}")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    import threading, queue
     main()
