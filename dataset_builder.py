@@ -10,7 +10,6 @@ import numpy as np
 import requests
 from tqdm import tqdm
 
-from dataset import process_archive  # Функция process_archive описана ниже
 from config import TRAINING_DATE_RANGES, URL_TEMPLATE, NUM_LEVELS, SEQUENCE_LENGTH, HORIZON_MS, SYMBOLS, MAX_TARGET_CHANGE_PERCENT
 
 # Функция для обработки одного архива (см. dataset.py для аналогичной логики)
