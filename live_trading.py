@@ -1,4 +1,4 @@
-# live_trading.py
+#!/usr/bin/env python3
 import asyncio
 import aiohttp
 import time
@@ -6,18 +6,50 @@ import numpy as np
 import torch
 import logging
 from model import CombinedModel
-from config import (TIMEFRAME_SECONDS, NUM_LEVELS, SEQUENCE_LENGTH, MIN_SIGNAL_PERCENT,
+from config import (TIMEFRAME_SECONDS, SEQUENCE_LENGTH, MIN_SIGNAL_PERCENT,
                     MIN_CONFIDENCE, SYMBOLS, TRADE_MAX_DURATION, TRADE_COOLDOWN,
                     DEFAULT_LEVERAGE, DEFAULT_STOP_LOSS_FACTOR, DEFAULT_TAKE_PROFIT_FACTOR,
                     DEFAULT_TRAILING_STOP, ERROR_COOLDOWN_SECONDS, NEGATIVE_PERFORMANCE_COOLDOWN_SECONDS,
-                    MIN_AVG_PROFIT_THRESHOLD, TOTAL_INPUT_DIM, RISK_PERCENTAGE, CONFIDENCE_SCALE, MAX_VOLATILITY_THRESHOLD)
-from bybit_ws import start_bybit_ws, get_orderbook
-from orderbook import get_features_from_orderbook, get_mid_price
+                    MIN_AVG_PROFIT_THRESHOLD, TOTAL_INPUT_DIM, RISK_PERCENTAGE, CONFIDENCE_SCALE,
+                    MAX_VOLATILITY_THRESHOLD, HORIZON_MS)
 from bybit_api import fetch_balance, create_order, fetch_candles
+from orderbook import Orderbook  # новый класс Orderbook
+from bybit_ws import get_orderbook  # предполагается, что он возвращает экземпляр Orderbook для символа
 
 logging.basicConfig(level=logging.INFO)
+
 error_cooldown_until = 0
 position_history = []
+
+def flatten_sequence(sequence):
+    """
+    Преобразует последовательность snapshot-ов (каждый – словарь с ключами 'bid', 'ask', 'mid')
+    в одномерный numpy-массив: [bid_0, ask_0, mid_0, bid_1, ask_1, mid_1, ...]
+    """
+    flat = []
+    for snap in sequence:
+        flat.extend([snap.get('bid', 0.0), snap.get('ask', 0.0), snap.get('mid', 0.0)])
+    return np.array(flat, dtype=np.float32)
+
+def compute_candle_features(candles):
+    """
+    Для каждого свечного интервала (словарь с ключами 'open', 'high', 'low', 'close')
+    вычисляет два признака: return = (close - open)/open и range = (high - low)/open.
+    Возвращает одномерный numpy-массив.
+    """
+    feats = []
+    for candle in candles:
+        o = candle['open']
+        c = candle['close']
+        h = candle['high']
+        l = candle['low']
+        if o != 0:
+            ret = (c - o) / o
+            rng = (h - l) / o
+        else:
+            ret, rng = 0, 0
+        feats.extend([ret, rng])
+    return np.array(feats, dtype=np.float32)
 
 async def calculate_position_size(session, symbol, side, entry_price, stoploss_price):
     try:
@@ -34,35 +66,33 @@ async def calculate_position_size(session, symbol, side, entry_price, stoploss_p
 async def compute_candle_features_from_api(session, symbol):
     data = await fetch_candles(session, symbol, interval="5", limit=60)
     candles = data.get("result", {}).get("list", [])
-    features = []
+    feats = []
     for candle in candles:
         try:
-            open_price = float(candle["open"])
-            close_price = float(candle["close"])
-            high = float(candle["high"])
-            low = float(candle["low"])
-            ret = (close_price - open_price) / open_price if open_price != 0 else 0
-            rng = (high - low) / open_price if open_price != 0 else 0
+            o = float(candle["open"])
+            c = float(candle["close"])
+            h = float(candle["high"])
+            l = float(candle["low"])
+            ret = (c - o) / o if o != 0 else 0
+            rng = (h - l) / o if o != 0 else 0
         except Exception:
             ret, rng = 0, 0
-        features.extend([ret, rng])
+        feats.extend([ret, rng])
     expected = 60 * 2
-    if len(features) < expected:
-        features.extend([0] * (expected - len(features)))
-    return features
+    if len(feats) < expected:
+        feats.extend([0] * (expected - len(feats)))
+    return np.array(feats, dtype=np.float32)
 
 async def trade_symbol(symbol, model, device):
     global error_cooldown_until, position_history
     position = None
     last_trade_time = 0
-    lob_buffer = []  # Накопленный LOB в виде плоского списка
     daily_profit = 0.0
     current_day = time.strftime("%Y-%m-%d", time.localtime())
 
     def check_performance():
         if len(position_history) >= 3:
-            recent = position_history[-3:]
-            return sum(recent) / len(recent)
+            return sum(position_history[-3:]) / 3.0
         return 0.0
 
     async with aiohttp.ClientSession() as session:
@@ -85,69 +115,38 @@ async def trade_symbol(symbol, model, device):
                     await asyncio.sleep(NEGATIVE_PERFORMANCE_COOLDOWN_SECONDS)
                     continue
 
-                current_time = time.time()
-                if position is not None:
-                    orderbook = get_orderbook(symbol)
-                    if orderbook is None:
-                        logging.warning(f"[{symbol}] Orderbook not available.")
-                    else:
-                        current_mid = get_mid_price(orderbook)
-                        if current_mid is None:
-                            logging.warning(f"[{symbol}] Could not compute mid price.")
-                        else:
-                            if (current_time - position['entry_time']) > TRADE_MAX_DURATION:
-                                logging.info(f"[{symbol}] Closing position due to duration.")
-                                if position['side'] == 'long':
-                                    profit = (current_mid - position['entry_price']) * position['qty']
-                                else:
-                                    profit = (position['entry_price'] - current_mid) * position['qty']
-                                daily_profit += profit
-                                position_history.append(profit)
-                                logging.info(f"[{symbol}] Trade profit: {profit:.2f} USDT, Daily profit: {daily_profit:.2f} USDT")
-                                position = None
-                                last_trade_time = current_time
-                    if position is not None:
-                        await asyncio.sleep(TIMEFRAME_SECONDS)
-                        continue
-
-                if current_time - last_trade_time < TRADE_COOLDOWN:
-                    logging.info(f"[{symbol}] Cooldown period after trade...")
+                # Получаем текущий Orderbook для символа
+                ob = get_orderbook(symbol)  # ожидается, что это экземпляр Orderbook
+                if ob is None:
+                    logging.info(f"[{symbol}] Orderbook not available.")
                     await asyncio.sleep(TIMEFRAME_SECONDS)
                     continue
 
-                orderbook = get_orderbook(symbol)
-                if orderbook is None:
-                    logging.info(f"[{symbol}] Waiting for orderbook update...")
+                features_dict = ob.get_features()  # {'sequence': [...], 'candles': [...]}
+                sequence = features_dict.get('sequence', [])
+                candles = features_dict.get('candles', [])
+                if len(sequence) < SEQUENCE_LENGTH:
+                    logging.info(f"[{symbol}] Accumulating orderbook snapshots...")
                     await asyncio.sleep(TIMEFRAME_SECONDS)
                     continue
 
-                lob_features = get_features_from_orderbook(orderbook, NUM_LEVELS)
-                lob_buffer.extend(lob_features)
-                max_buffer_length = SEQUENCE_LENGTH * (NUM_LEVELS * 4)
-                if len(lob_buffer) > max_buffer_length:
-                    lob_buffer = lob_buffer[-max_buffer_length:]
-                if len(lob_buffer) < max_buffer_length:
-                    logging.info(f"[{symbol}] Accumulating LOB data...")
-                    await asyncio.sleep(TIMEFRAME_SECONDS)
-                    continue
-
-                candle_features = await compute_candle_features_from_api(session, symbol)
-                combined_features = np.array(lob_buffer + candle_features, dtype=np.float32)
+                # Используем последние SEQUENCE_LENGTH snapshot-ов
+                seq_window = sequence[-SEQUENCE_LENGTH:]
+                lob_flat = flatten_sequence(seq_window)
+                candle_feats = compute_candle_features(candles)
+                combined_features = np.concatenate((lob_flat, candle_feats))
                 inp = torch.tensor(combined_features, dtype=torch.float32).unsqueeze(0).to(device)
                 with torch.no_grad():
                     predicted_delta_pct = model(inp).item()
                 logging.info(f"[{symbol}] Predicted percentage change: {predicted_delta_pct*100:.2f}%")
 
-                orderbook = get_orderbook(symbol)
-                if orderbook is None:
-                    await asyncio.sleep(TIMEFRAME_SECONDS)
-                    continue
-                current_mid = get_mid_price(orderbook)
+                current_mid = sequence[-1].get('mid', None)
                 if current_mid is None:
+                    logging.info(f"[{symbol}] Current mid price not available.")
                     await asyncio.sleep(TIMEFRAME_SECONDS)
                     continue
 
-                volatility_pct = np.std(lob_buffer) / np.mean(lob_buffer)
+                volatility_pct = np.std(lob_flat) / (np.mean(lob_flat) + 1e-6)
                 if volatility_pct > MAX_VOLATILITY_THRESHOLD:
                     logging.info(f"[{symbol}] Volatility {volatility_pct*100:.2f}% exceeds threshold; skipping trade.")
                     await asyncio.sleep(TIMEFRAME_SECONDS)
@@ -189,7 +188,7 @@ async def trade_symbol(symbol, model, device):
                         last_trade_time = time.time()
                 else:
                     logging.info(f"[{symbol}] No clear trading signal.")
-
+                
                 await asyncio.sleep(TIMEFRAME_SECONDS)
             except Exception as e:
                 logging.error(f"[{symbol}] Error in main loop: {e}")
@@ -208,15 +207,9 @@ async def main():
     model.to(device)
     model.eval()
     logging.info("Model loaded successfully.")
-
-    async with aiohttp.ClientSession() as session:
-        ws_task = asyncio.create_task(start_bybit_ws())
-        tasks = [trade_symbol(symbol, model, device) for symbol in SYMBOLS]
-        await asyncio.gather(*tasks)
-        await ws_task()
+    
+    tasks = [trade_symbol(symbol, model, device) for symbol in SYMBOLS]
+    await asyncio.gather(*tasks)
 
 if __name__ == '__main__':
-    """
-    IMPORTANT: Test thoroughly in paper trading mode before using real funds.
-    """
     asyncio.run(main())

@@ -6,28 +6,18 @@ import re
 import threading
 import queue
 import time
-from datetime import datetime, timedelta
-import numpy as np
-import requests
-import io
 import json
 import zipfile
+import io
+import requests
+import numpy as np
 from tqdm import tqdm
-from sortedcontainers import SortedList
-from orderbook import OrderBookSide, get_features_from_orderbook, get_mid_price
-from config import (TRAINING_DATE_RANGES, URL_TEMPLATE, SYMBOLS, NUM_LEVELS,
-                    SEQUENCE_LENGTH, HORIZON_MS, MAX_TARGET_CHANGE_PERCENT,
-                    CANDLE_INTERVAL_MIN, CANDLE_TOTAL_HOURS)
+from config import TRAINING_DATE_RANGES, URL_TEMPLATE, SYMBOLS, SEQUENCE_LENGTH, HORIZON_MS, MAX_TARGET_CHANGE_PERCENT, CANDLE_INTERVAL_MIN, CANDLE_TOTAL_HOURS
+from orderbook import Orderbook
 
-import logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-
-# -----------------------------------------------------------------------------
-# Функции расчёта признаков
-# -----------------------------------------------------------------------------
 def generate_date_urls(date_range, template):
-    """Принимает строку 'YYYY-MM-DD,YYYY-MM-DD' и возвращает список URL-ов."""
     start_str, end_str = date_range.split(',')
+    from datetime import datetime, timedelta
     start_date = datetime.strptime(start_str.strip(), "%Y-%m-%d")
     end_date = datetime.strptime(end_str.strip(), "%Y-%m-%d")
     urls = []
@@ -39,14 +29,13 @@ def generate_date_urls(date_range, template):
     return urls
 
 def open_zip(source):
-    """Открывает zip-архив по URL или локальному пути."""
     if isinstance(source, str) and source.startswith("http"):
         try:
             r = requests.get(source)
             r.raise_for_status()
             return zipfile.ZipFile(io.BytesIO(r.content))
         except Exception as e:
-            logging.error(f"Error downloading {source}: {e}")
+            print(f"Error downloading {source}: {e}")
             return None
     else:
         try:
@@ -54,56 +43,47 @@ def open_zip(source):
                 content = f.read()
             return zipfile.ZipFile(io.BytesIO(content))
         except Exception as e:
-            logging.error(f"Error opening zip file {source}: {e}")
+            print(f"Error opening zip file {source}: {e}")
             return None
 
-def compute_candle_features(records, end_time):
+def compute_candle_features_from_candles(candles, end_ts):
     """
-    Группирует записи по 5-минутным интервалам за последние 5 часов (60 свечей)
-    и для каждого интервала вычисляет два признака: return и range.
+    Для свечей, завершившихся до end_ts, вычисляет для каждой свечи:
+      - return = (close - open)/open
+      - range = (high - low)/open
+    Возвращает одномерный numpy-массив.
     """
-    interval_ms = CANDLE_INTERVAL_MIN * 60 * 1000
-    candle_count = int((CANDLE_TOTAL_HOURS * 60) / CANDLE_INTERVAL_MIN)
-    start_time = end_time - (CANDLE_TOTAL_HOURS * 60 * 1000)
-    buckets = [[] for _ in range(candle_count)]
-    for rec in records:
-        ts = rec["ts"]
-        if start_time <= ts < end_time:
-            bucket_index = int((ts - start_time) // interval_ms)
-            if bucket_index < candle_count:
-                buckets[bucket_index].append(rec["mid_price"])
-    features = []
-    for bucket in buckets:
-        if bucket:
-            open_price = bucket[0]
-            close_price = bucket[-1]
-            high = max(bucket)
-            low = min(bucket)
-            ret = (close_price - open_price) / open_price if open_price != 0 else 0
-            rng = (high - low) / open_price if open_price != 0 else 0
-        else:
-            ret, rng = 0, 0
-        features.extend([ret, rng])
-    return features
+    feats = []
+    for candle in candles:
+        if candle.get('end', 0) <= end_ts:
+            o = candle['open']
+            c = candle['close']
+            h = candle['high']
+            l = candle['low']
+            if o != 0:
+                ret = (c - o) / o
+                rng = (h - l) / o
+            else:
+                ret, rng = 0, 0
+            feats.extend([ret, rng])
+    return np.array(feats, dtype=np.float32)
 
-# -----------------------------------------------------------------------------
-# Обработка архивного файла
-# -----------------------------------------------------------------------------
 def process_archive_file(filepath):
-    logging.info(f"Processing file: {filepath}")
+    print(f"Processing archive: {filepath}")
     try:
         with open(filepath, "rb") as f:
             content = f.read()
     except Exception as e:
-        logging.error(f"Error reading file {filepath}: {e}")
+        print(f"Error reading {filepath}: {e}")
         return []
     try:
         zf = zipfile.ZipFile(io.BytesIO(content))
     except Exception as e:
-        logging.error(f"Error opening zip file {filepath}: {e}")
+        print(f"Error opening zip file {filepath}: {e}")
         return []
-    records = []
-    current_ob = None
+    # Создаем новый экземпляр Orderbook
+    ob = Orderbook()
+    # Для каждого файла внутри архива
     for file_name in zf.namelist():
         with zf.open(file_name) as f:
             for line in f:
@@ -113,108 +93,68 @@ def process_archive_file(filepath):
                     continue
                 data = record.get('data', {})
                 r_type = record.get('type')
-                if r_type == 'snapshot' or data.get('u') == 1:
-                    current_ob = {
-                        'a': OrderBookSide(is_bid=False),
-                        'b': OrderBookSide(is_bid=True)
-                    }
-                    if 'a' in data:
-                        for level in data['a']:
-                            try:
-                                price = float(level[0])
-                                size = float(level[1])
-                                current_ob['a'].update(price, size)
-                            except Exception:
-                                continue
-                    if 'b' in data:
-                        for level in data['b']:
-                            try:
-                                price = float(level[0])
-                                size = float(level[1])
-                                current_ob['b'].update(price, size)
-                            except Exception:
-                                continue
-                elif r_type == 'delta':
-                    if current_ob is None:
-                        continue
-                    for side in ['a', 'b']:
-                        if side in data:
-                            for update in data[side]:
-                                try:
-                                    price = float(update[0])
-                                    size = float(update[1])
-                                except Exception:
-                                    continue
-                                current_ob[side].update(price, size)
-                else:
-                    continue
-                if current_ob is None:
-                    continue
-                ob_lists = {
-                    'a': current_ob['a'].get_list(),
-                    'b': current_ob['b'].get_list()
-                }
-                mid = get_mid_price(ob_lists)
-                if mid is None:
-                    continue
-                feats = get_features_from_orderbook(ob_lists, NUM_LEVELS)
                 ts = record.get('ts')
                 try:
                     ts = int(ts)
                 except:
-                    continue
-                records.append({"ts": ts, "features": feats, "mid_price": mid})
+                    ts = int(time.time())
+                ob.update(data, r_type, timestamp=ts)
     zf.close()
-    records.sort(key=lambda x: x["ts"])
+    # Извлекаем накопленные фичи: sequence (snapshot-ы) и свечи
+    features = ob.get_features()  # {'sequence': [...], 'candles': [...]}
+    sequence = features.get('sequence', [])
+    candles = features.get('candles', [])
     samples = []
-    n = len(records)
+    n = len(sequence)
+    # Генерируем обучающие примеры: для каждого snapshot, ищем будущий snapshot, чтобы вычислить target_delta
     for i in range(n):
-        start_ts = records[i]["ts"]
+        current_snap = sequence[i]
+        current_ts = current_snap.get('ts')
+        if current_ts is None:
+            continue
         target_index = None
         for j in range(i+1, n):
-            if records[j]["ts"] >= start_ts + HORIZON_MS:
+            if sequence[j].get('ts', 0) >= current_ts + HORIZON_MS:
                 target_index = j
                 break
         if target_index is None:
             break
-        start_mid = records[i]["mid_price"]
-        target_mid = records[target_index]["mid_price"]
+        start_mid = current_snap.get('mid')
+        target_mid = sequence[target_index].get('mid')
+        if start_mid is None or target_mid is None or start_mid == 0:
+            continue
         target_delta = (target_mid - start_mid) / start_mid
         if abs(target_delta) > MAX_TARGET_CHANGE_PERCENT:
             continue
         if i - SEQUENCE_LENGTH + 1 < 0:
             continue
-        lob_seq = []
-        for k in range(i - SEQUENCE_LENGTH + 1, i + 1):
-            lob_seq.extend(records[k]["features"])
-        candle_feats = compute_candle_features(records, start_ts)
-        combined = lob_seq + candle_feats
-        samples.append({
-            "features": np.array(combined, dtype=np.float32),
-            "target": np.float32(target_delta)
-        })
-    logging.info(f"Finished processing {filepath}. Generated {len(samples)} samples.")
+        seq_window = sequence[i - SEQUENCE_LENGTH + 1 : i+1]
+        # Преобразуем окно snapshot-ов: для каждого берём [bid, ask, mid]
+        lob_features = []
+        for snap in seq_window:
+            lob_features.extend([snap.get('bid', 0.0), snap.get('ask', 0.0), snap.get('mid', 0.0)])
+        # Используем свечи, завершившиеся до current_ts
+        candle_feats = compute_candle_features_from_candles(candles, current_ts)
+        combined = np.array(lob_features + list(candle_feats), dtype=np.float32)
+        samples.append({"features": combined, "target": np.float32(target_delta)})
     return samples
 
-# -----------------------------------------------------------------------------
-# Продюсер и потребитель: скачивание архивов
-# -----------------------------------------------------------------------------
 def download_archive(url, zips_dir):
     try:
-        response = requests.get(url)
-        response.raise_for_status()
+        r = requests.get(url)
+        r.raise_for_status()
         filename = url.split("/")[-1]
         filepath = os.path.join(zips_dir, filename)
         with open(filepath, "wb") as f:
-            f.write(response.content)
-        logging.info(f"Downloaded: {filepath}")
+            f.write(r.content)
+        print(f"Downloaded: {filepath}")
         return filepath
     except Exception as e:
-        logging.error(f"Error downloading {url}: {e}")
+        print(f"Error downloading {url}: {e}")
         return None
 
 def processor_worker(filepath):
-    logging.info(f"Started processing archive {os.path.basename(filepath)}")
+    print(f"Started processing {filepath}")
     return process_archive_file(filepath)
 
 def build_dataset_for_pairs(selected_pairs):
@@ -226,36 +166,18 @@ def build_dataset_for_pairs(selected_pairs):
             all_urls.extend(urls)
     return all_urls
 
-# -----------------------------------------------------------------------------
-# Отдельный поток для записи файлов (одновременно только один)
-# -----------------------------------------------------------------------------
-def writer_thread_func(write_queue, stop_event):
-    logging.info("Writer thread started.")
-    while not stop_event.is_set() or not write_queue.empty():
-        try:
-            output_path, X, Y = write_queue.get(timeout=1)
-            np.savez_compressed(output_path, X=X, Y=Y)
-            logging.info(f"Written file: {output_path} (samples: {X.shape[0]})")
-        except queue.Empty:
-            continue
-    logging.info("Writer thread stopped.")
-
-# -----------------------------------------------------------------------------
-# Основная функция
-# -----------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(description="Dataset builder for trade bot.")
     parser.add_argument("--pair-index", type=int, default=None,
-                        help="Номер пары из списка SYMBOLS (0-based). Если не указан, обрабатываются все пары.")
+                        help="Index of pair from SYMBOLS (0-based). If not specified, process all pairs.")
     args = parser.parse_args()
-
     if args.pair_index is not None:
         selected_pairs = [SYMBOLS[args.pair_index]]
     else:
         selected_pairs = SYMBOLS
 
     all_urls = build_dataset_for_pairs(selected_pairs)
-    logging.info(f"Total archives to process: {len(all_urls)}")
+    print(f"Total archives to process: {len(all_urls)}")
     os.makedirs("zips", exist_ok=True)
     os.makedirs("data", exist_ok=True)
 
@@ -263,8 +185,8 @@ def main():
     write_queue = queue.Queue()
     stop_event = threading.Event()
 
-    # Запуск потока для скачивания архивов
     def downloader():
+        from tqdm import tqdm
         for url in tqdm(all_urls, desc="Downloading archives"):
             if stop_event.is_set():
                 break
@@ -276,11 +198,18 @@ def main():
             if filepath:
                 download_queue.put(filepath)
 
-    downloader_thread = threading.Thread(target=downloader, name="Downloader")
-    downloader_thread.start()
+    def writer_thread_func():
+        while not stop_event.is_set() or not write_queue.empty():
+            try:
+                output_path, X, Y = write_queue.get(timeout=1)
+                np.savez_compressed(output_path, X=X, Y=Y)
+                print(f"Written: {output_path} (samples: {X.shape[0]})")
+            except queue.Empty:
+                continue
 
-    # Запуск отдельного потока для записи файлов (одновременно только один)
-    writer_thread = threading.Thread(target=writer_thread_func, args=(write_queue, stop_event), name="Writer")
+    downloader_thread = threading.Thread(target=downloader)
+    writer_thread = threading.Thread(target=writer_thread_func)
+    downloader_thread.start()
     writer_thread.start()
 
     regex = re.compile(r"(\d{4}-\d{2}-\d{2})_([A-Z]+)_ob500\.data\.zip")
@@ -290,7 +219,6 @@ def main():
     try:
         from concurrent.futures import ProcessPoolExecutor, as_completed, TimeoutError
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
-            # Отправляем задачи в пул, пока скачиватель работает или очередь не пуста
             while downloader_thread.is_alive() or not download_queue.empty():
                 if stop_event.is_set():
                     break
@@ -301,8 +229,7 @@ def main():
                 future = executor.submit(processor_worker, filepath)
                 future.filepath = filepath
                 futures.append(future)
-            # Обрабатываем результаты по мере завершения
-            for future in tqdm(as_completed(futures), total=len(futures), desc="Processing archives"):
+            for future in as_completed(futures, timeout=300):
                 filepath = getattr(future, "filepath", "unknown")
                 try:
                     samples = future.result(timeout=300)
@@ -314,40 +241,35 @@ def main():
                     else:
                         key = "unknown"
                     if samples:
-                        try:
-                            features_list = [s["features"] for s in samples]
-                            targets_list = [s["target"] for s in samples]
-                            X = np.stack(features_list)
-                            Y = np.array(targets_list)
-                            archive_id = os.path.splitext(os.path.basename(filepath))[0]
-                            output_path = os.path.join("data", f"{key}_{archive_id}.npz")
-                            # Вместо записи здесь, кладем данные в очередь для writer-а
-                            write_queue.put((output_path, X, Y))
-                            logging.info(f"Queued file for writing: {output_path}")
-                        except Exception as e:
-                            logging.error(f"Error preparing output for {filepath}: {e}")
+                        features_list = [s["features"] for s in samples]
+                        targets_list = [s["target"] for s in samples]
+                        X = np.stack(features_list)
+                        Y = np.array(targets_list)
+                        archive_id = os.path.splitext(os.path.basename(filepath))[0]
+                        output_path = os.path.join("data", f"{key}_{archive_id}.npz")
+                        write_queue.put((output_path, X, Y))
+                        print(f"Queued {output_path} for writing")
                 except TimeoutError:
-                    logging.error(f"Timeout processing {filepath}")
+                    print(f"Timeout processing {filepath}")
                     future.cancel()
                 except Exception as e:
-                    logging.error(f"Error processing {filepath}: {e}")
+                    print(f"Error processing {filepath}: {e}")
                 finally:
                     try:
                         os.remove(filepath)
-                        logging.info(f"Deleted archive: {filepath}")
+                        print(f"Deleted {filepath}")
                     except Exception as e:
-                        logging.error(f"Failed to delete file {filepath}: {e}")
+                        print(f"Failed to delete {filepath}: {e}")
     except KeyboardInterrupt:
-        logging.info("KeyboardInterrupt received, stopping...")
+        print("KeyboardInterrupt received, stopping...")
         stop_event.set()
     finally:
         downloader_thread.join()
-        # Ждем, пока все задачи записи будут обработаны
         while not write_queue.empty():
             time.sleep(0.5)
         stop_event.set()
         writer_thread.join()
-        logging.info("Processing finished.")
+        print("Processing finished.")
 
 if __name__ == '__main__':
     main()

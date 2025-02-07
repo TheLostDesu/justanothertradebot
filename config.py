@@ -42,7 +42,7 @@ TRAIN_BATCH_SIZE = 256
 TRAIN_LEARNING_RATE = 1e-4
 
 # --- LOB and Candle parameters ---
-SEQUENCE_LENGTH = 10          # Количество LOB-снимков
+SEQUENCE_LENGTH = 120          # Количество LOB-снимков
 HORIZON_MS = 10000            # Горизонт для расчёта target (10 сек)
 NUM_LEVELS = 5
 
