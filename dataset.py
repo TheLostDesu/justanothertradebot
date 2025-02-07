@@ -245,7 +245,7 @@ def main():
     os.makedirs(zips_dir, exist_ok=True)
     os.makedirs(data_dir, exist_ok=True)
 
-    num_workers = os.cpu_count() or 4
+    num_workers = 12
     logging.info(f"Запуск обработки архивов в {num_workers} процессах.")
     ctx = multiprocessing.get_context("spawn")
     with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers, mp_context=ctx) as executor:
