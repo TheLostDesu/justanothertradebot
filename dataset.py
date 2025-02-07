@@ -4,10 +4,10 @@
 
 Каждый URL обрабатывается в отдельном потоке:
   - Если архив отсутствует в папке zips и передан флаг --download, архив скачивается.
-  - Архив обрабатывается «на лету»: из записей формируются snapshot‑ы с интервалом 10 сек,  
-    и, когда для первого snapshot‑а проходит 30 сек, формируется обучающий пример.
+  - Архив обрабатывается «на лету»: из записей формируются snapshot‑ы с интервалом 10 сек,
+    и когда для первого snapshot‑а проходит 30 сек, формируется обучающий пример.
   - Если обучающие примеры сформированы, .npz файл записывается в папку data.
-  - В качестве результата возвращается строка с информацией о выполненной задаче.
+  - Результатом работы каждого потока является строка с информацией о выполненной задаче.
 """
 
 import os
@@ -24,10 +24,10 @@ import concurrent.futures
 import traceback
 
 # Импортируем настройки и класс Orderbook.
-# Убедитесь, что Orderbook и все используемые настройки (например, из config) определены на уровне модуля.
+# Убедитесь, что модуль config и класс Orderbook определены на уровне модуля.
 from config import (
     TRAINING_DATE_RANGES,   # например, ["2025-01-01,2025-01-07"]
-    URL_TEMPLATE,           # "https://quote-saver.bycsi.com/orderbook/linear/{pair}/{date}_{pair}_ob500.data.zip"
+    URL_TEMPLATE,           # например, "https://quote-saver.bycsi.com/orderbook/linear/{pair}/{date}_{pair}_ob500.data.zip"
     SYMBOLS,                # список, например, ["BTC/USDT", "ETH/USDT", …]
     SEQUENCE_LENGTH,        # длина окна (например, 3)
     HORIZON_MS              # горизонт в секундах (например, 30)
@@ -36,7 +36,7 @@ from orderbook import Orderbook
 
 # Интервалы (в секундах)
 SNAPSHOT_INTERVAL = 10    # собираем snapshot раз в 10 секунд
-TRAINING_HORIZON  = 30    # через 30 секунд после появления первого snapshot-а считается исход
+TRAINING_HORIZON  = 30    # через 30 секунд после появления первого snapshot‑а считается исход
 
 # Настройка логирования
 logging.basicConfig(
@@ -47,7 +47,7 @@ logging.basicConfig(
 
 def generate_date_urls(date_range: str, pair: str) -> list:
     """
-    Для диапазона дат (строка "YYYY-MM-DD,YYYY-MM-DD") и торговой пары (без символа "/")
+    Для диапазона дат (например, "2025-01-01,2025-01-07") и торговой пары (без символа "/")
     формирует список URL архивов.
     """
     start_str, end_str = date_range.split(',')
@@ -72,6 +72,7 @@ def download_archive(url: str, zips_dir: str) -> str:
     if os.path.exists(filepath):
         logging.info(f"Архив уже существует: {filepath}")
         return filepath
+
     logging.info(f"Скачиваем {url} ...")
     try:
         resp = requests.get(url)
@@ -100,7 +101,7 @@ def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
          возвращаются накопленные данные.
     """
     training_examples = []
-    feature_queue = []      # очередь snapshot‑ов (каждый snapshot – dict с 'bid', 'ask', 'mid', 'ts')
+    feature_queue = []      # очередь snapshot‑ов (каждый snapshot – dict с ключами 'bid', 'ask', 'mid', 'ts')
     last_snapshot_time = None
     last_generated_time = time.time()
     ob = Orderbook()
@@ -116,7 +117,6 @@ def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
                 with zf.open(filename) as f:
                     for line in f:
                         bytes_read += len(line)
-                        # Логирование процента обработанных байт
                         current_percentage = int((bytes_read / total_size) * 100)
                         for threshold in [1, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]:
                             if current_percentage >= threshold and threshold not in logged_thresholds:
@@ -181,7 +181,7 @@ def download_and_process(url: str, zips_dir: str, data_dir: str, timeout: float,
     """
     Для данного URL:
       - Если архив отсутствует и download=True, скачивает архив.
-      - Если архив найден (или уже скачан), запускает его обработку.
+      - Если архив найден (или уже скачан), обрабатывает его.
       - Если сформированы обучающие примеры, записывает .npz файл в data_dir.
       - Возвращает строку с результатом.
     """
@@ -254,6 +254,6 @@ def main():
                 logging.info(f"Результат: {result}")
             except Exception as e:
                 logging.error(f"Ошибка получения результата из future: {e}")
-    
+
 if __name__ == "__main__":
     main()
