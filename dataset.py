@@ -2,10 +2,11 @@
 """
 Построение датасета фич из архивов ордербуков.
 
-Для каждого URL архив обрабатывается сразу:
-  - Если архив отсутствует, он скачивается (при переданном флаге --download).
-  - Обработка (парсинг, сбор snapshot-ов и формирование обучающих примеров) запускается в отдельном потоке.
-  - Многопоточность применяется только на этапе обработки архивов.
+Для каждого URL архив сразу обрабатывается:
+  - Если архив отсутствует в папке zips и передан флаг --download, архив скачивается.
+  - Затем обработка (парсинг, сбор snapshot-ов, формирование обучающих примеров) запускается в отдельном процессе.
+  
+Многопроцессорность используется для полной загрузки всех CPU‑ядер при CPU‑интенсивной обработке.
 """
 
 import os
@@ -32,7 +33,7 @@ from config import (
 from orderbook import Orderbook
 
 # Интервалы (в секундах)
-SNAPSHOT_INTERVAL = 10    # делаем snapshot раз в 10 секунд
+SNAPSHOT_INTERVAL = 10    # собираем snapshot раз в 10 секунд
 TRAINING_HORIZON  = 30    # через 30 секунд после появления первого snapshot-а считается исход
 
 # Настройка логирования
@@ -43,7 +44,7 @@ logging.basicConfig(
 )
 
 # =========================================================
-# Формирование URL-ов архивов для заданного диапазона и торговой пары
+# Функция формирования URL-ов архивов для заданного диапазона и торговой пары
 # =========================================================
 def generate_date_urls(date_range: str, pair: str) -> list:
     """
@@ -89,19 +90,19 @@ def download_archive(url: str, zips_dir: str) -> str:
         return None
 
 # =========================================================
-# Функция потоковой обработки архива
+# Функция потоковой (на лету) обработки архива
 # =========================================================
 def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
     """
-    Обрабатывает архив (zip‑файл) потоково.
+    Обрабатывает архив (zip‑файл) «на лету».
 
     Алгоритм:
-      1. Читаем записи из архива и обновляем Orderbook.
+      1. Из записей архива обновляется Orderbook.
       2. Раз в SNAPSHOT_INTERVAL (10 сек) извлекается snapshot (фича) и добавляется в очередь.
       3. Если время текущей записи (ts) >= времени первого snapshot-а + TRAINING_HORIZON (30 сек)
          и в очереди накоплено не менее SEQUENCE_LENGTH snapshot‑ов, формируется обучающий пример:
-            – признаки: объединяем (flatten) первые SEQUENCE_LENGTH snapshot‑ов ([bid, ask, mid])
-            – цель: относительное изменение mid‑цены, вычисленное как (current_mid – candidate_mid) / candidate_mid.
+            – признаки: объединяются (flatten) первые SEQUENCE_LENGTH snapshot‑ов ([bid, ask, mid])
+            – цель: относительное изменение mid‑цены, вычисляемое как (current_mid – candidate_mid) / candidate_mid.
          После формирования примера первый snapshot удаляется из очереди.
       4. Если в течение timeout (30 сек) реального времени не появляется новый пример,
          возвращаются накопленные данные.
@@ -126,7 +127,7 @@ def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
                     for line in f:
                         line_count += 1
                         bytes_read += len(line)
-                        # Логирование прогресса по процентам
+                        # Логирование процента обработанных байт
                         current_percentage = int((bytes_read / total_size) * 100)
                         for threshold in [1, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]:
                             if current_percentage >= threshold and threshold not in logged_thresholds:
@@ -145,11 +146,10 @@ def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
                         except Exception:
                             ts = time.time()
 
-                        # Обновляем Orderbook; предполагается, что Orderbook.update() раз в секунду
-                        # сохраняет snapshot, а get_snapshot_features() возвращает словарь с [bid, ask, mid]
+                        # Обновляем Orderbook (предполагается, что Orderbook.update() раз в секунду сохраняет snapshot)
                         ob.update(data, r_type, timestamp=ts)
 
-                        # Получаем snapshot и добавляем метку времени (если её нет)
+                        # Получаем snapshot из Orderbook и добавляем метку времени, если её нет
                         snap = ob.get_snapshot_features()
                         if snap is None:
                             continue
@@ -162,7 +162,7 @@ def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
                             last_snapshot_time = ts
                             logging.debug(f"Добавлен snapshot: ts={ts}")
 
-                        # Формируем обучающие примеры, если для первого snapshot-а прошло TRAINING_HORIZON секунд
+                        # Формируем обучающие примеры из очереди, если для первого snapshot-а прошло TRAINING_HORIZON секунд
                         while feature_queue:
                             candidate = feature_queue[0]
                             if ts >= candidate["ts"] + TRAINING_HORIZON:
@@ -184,6 +184,7 @@ def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
                                         "features": features_vec,
                                         "target": np.float32(target_delta)
                                     })
+                                    logging.info(f"Сформирован обучающий пример (всего примеров: {len(training_examples)})")
                                     # Удаляем первый snapshot из очереди
                                     feature_queue.pop(0)
                                     last_generated_time = time.time()
@@ -209,10 +210,9 @@ def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
 def download_and_process(url: str, zips_dir: str, timeout: float, download: bool) -> tuple:
     """
     Для данного URL:
-      - Проверяет наличие локального архива.
-      - Если отсутствует и download=True, скачивает архив.
-      - Если архив найден, запускает его обработку и возвращает (archive_filename, training_examples).
-      - Если архив не найден и download=False, возвращается None.
+      - Если архив отсутствует и download=True, скачивает архив.
+      - Если архив найден (или уже скачан), запускает его обработку.
+      - Возвращает (archive_filename, training_examples) или None, если архив недоступен.
     """
     filename = url.split("/")[-1]
     filepath = os.path.join(zips_dir, filename)
@@ -234,7 +234,7 @@ def download_and_process(url: str, zips_dir: str, timeout: float, download: bool
 # =========================================================
 def main():
     parser = argparse.ArgumentParser(
-        description="Построение датасета фич из архивов ордербуков (обработка архивов многопоточная)."
+        description="Построение датасета фич из архивов ордербуков (обработка архивов в процессах)."
     )
     parser.add_argument("--pair-index", type=int, default=None,
                         help="Индекс торговой пары из SYMBOLS (0-based). Если не указан – обрабатываются все пары.")
@@ -242,13 +242,13 @@ def main():
                         help="Скачивать архивы, если их нет в папке zips.")
     args = parser.parse_args()
 
-    # Определяем, какие торговые пары обрабатывать.
+    # Определяем, какие торговые пары обрабатывать
     if args.pair_index is not None:
         selected_pairs = [SYMBOLS[args.pair_index]]
     else:
         selected_pairs = SYMBOLS
 
-    # Формируем список URL-ов архивов для выбранных пар и диапазонов дат.
+    # Формируем список URL-ов архивов для выбранных пар и диапазонов дат
     all_urls = []
     for dr in TRAINING_DATE_RANGES:
         for sym in selected_pairs:
@@ -262,14 +262,12 @@ def main():
     os.makedirs(zips_dir, exist_ok=True)
     os.makedirs(data_dir, exist_ok=True)
 
-    # Многопоточная обработка архивов: для каждого URL сразу запускается задача, которая скачивает (если нужно)
-    # и обрабатывает архив.
-    num_workers = min(len(all_urls), os.cpu_count() or 4)
-    logging.info(f"Запуск обработки архивов в {num_workers} потоках.")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
-        # Создаём задачи для каждого URL
+    # Многопроцессорная обработка архивов: сразу запускаем задачу для каждого URL
+    num_workers = os.cpu_count() or 4
+    logging.info(f"Запуск обработки архивов в {num_workers} процессах.")
+    with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
         future_to_url = {
-            executor.submit(download_and_process, url, zips_dir, timeout=30, download=args.download): url
+            executor.submit(download_and_process, url, zips_dir, 30, args.download): url
             for url in all_urls
         }
         for future in concurrent.futures.as_completed(future_to_url):
