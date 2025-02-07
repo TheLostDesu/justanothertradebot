@@ -20,8 +20,9 @@ def custom_loss(predictions, targets, min_signal_percent=MIN_SIGNAL_PERCENT, pen
     return (mse + penalty_factor * penalty).mean()
 
 # Загружаем объединённый датасет из файла dataset.pkl
-with open("dataset.pkl", "rb") as f:
-    dataset_data = pickle.load(f)
+# with open("dataset.pkl", "rb") as f:
+#     dataset_data = pickle.load(f)
+dataset_data = np.load("dataset.npz")
 features = dataset_data["features"]
 targets = dataset_data["targets"]
 full_dataset = TensorDataset(torch.from_numpy(features), torch.from_numpy(targets))
