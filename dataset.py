@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-Построение датасета фич из архивов ордербуков с использованием ProcessPoolExecutor.
-Каждый URL обрабатывается в отдельном процессе:
-  - Если архив отсутствует и передан флаг --download, архив скачивается.
-  - Затем архив обрабатывается (парсинг, сбор snapshot-ов, формирование обучающих примеров),
-    и результат (файл .npz) сохраняется прямо внутри дочернего процесса.
-  - В качестве результата возвращается только строка с информацией.
+Построение датасета фич из архивов ордербуков с использованием ThreadPoolExecutor.
+
+Каждый URL обрабатывается в отдельном потоке:
+  - Если архив отсутствует в папке zips и передан флаг --download, архив скачивается.
+  - Архив обрабатывается «на лету»: из записей формируются snapshot‑ы с интервалом 10 сек,  
+    и, когда для первого snapshot‑а проходит 30 сек, формируется обучающий пример.
+  - Если обучающие примеры сформированы, .npz файл записывается в папку data.
+  - В качестве результата возвращается строка с информацией о выполненной задаче.
 """
 
 import os
@@ -20,13 +22,13 @@ import numpy as np
 from datetime import datetime, timedelta
 import concurrent.futures
 import traceback
-import multiprocessing
 
-# Импортируем настройки и класс Orderbook
+# Импортируем настройки и класс Orderbook.
+# Убедитесь, что Orderbook и все используемые настройки (например, из config) определены на уровне модуля.
 from config import (
     TRAINING_DATE_RANGES,   # например, ["2025-01-01,2025-01-07"]
     URL_TEMPLATE,           # "https://quote-saver.bycsi.com/orderbook/linear/{pair}/{date}_{pair}_ob500.data.zip"
-    SYMBOLS,                # список, например, ["BTC/USDT", "ETH/USDT", ...]
+    SYMBOLS,                # список, например, ["BTC/USDT", "ETH/USDT", …]
     SEQUENCE_LENGTH,        # длина окна (например, 3)
     HORIZON_MS              # горизонт в секундах (например, 30)
 )
@@ -89,7 +91,7 @@ def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
     Алгоритм:
       1. Из записей архива обновляется Orderbook.
       2. Раз в SNAPSHOT_INTERVAL (10 сек) извлекается snapshot (фича) и добавляется в очередь.
-      3. Если время текущей записи (ts) >= времени первого snapshot-а + TRAINING_HORIZON (30 сек)
+      3. Если время текущей записи (ts) >= времени первого snapshot‑а + TRAINING_HORIZON (30 сек)
          и в очереди накоплено не менее SEQUENCE_LENGTH snapshot‑ов, формируется обучающий пример:
             – признаки: объединяются (flatten) первые SEQUENCE_LENGTH snapshot‑ов ([bid, ask, mid])
             – цель: относительное изменение mid‑цены, вычисляемое как (current_mid – candidate_mid) / candidate_mid.
@@ -99,7 +101,7 @@ def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
     """
     training_examples = []
     feature_queue = []      # очередь snapshot‑ов (каждый snapshot – dict с 'bid', 'ask', 'mid', 'ts')
-    last_snapshot_time = None  
+    last_snapshot_time = None
     last_generated_time = time.time()
     ob = Orderbook()
 
@@ -114,6 +116,7 @@ def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
                 with zf.open(filename) as f:
                     for line in f:
                         bytes_read += len(line)
+                        # Логирование процента обработанных байт
                         current_percentage = int((bytes_read / total_size) * 100)
                         for threshold in [1, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]:
                             if current_percentage >= threshold and threshold not in logged_thresholds:
@@ -179,7 +182,7 @@ def download_and_process(url: str, zips_dir: str, data_dir: str, timeout: float,
     Для данного URL:
       - Если архив отсутствует и download=True, скачивает архив.
       - Если архив найден (или уже скачан), запускает его обработку.
-      - Если сформированы обучающие примеры, записывает .npz файл прямо в data_dir.
+      - Если сформированы обучающие примеры, записывает .npz файл в data_dir.
       - Возвращает строку с результатом.
     """
     try:
@@ -192,7 +195,7 @@ def download_and_process(url: str, zips_dir: str, data_dir: str, timeout: float,
                     logging.error(f"Не удалось скачать архив {url}")
                     return f"Archive {url} failed download"
             else:
-                logging.warning(f"Архив {filepath} не найден. Для скачивания используйте флаг --download")
+                logging.warning(f"Архив {filepath} не найден. Используйте флаг --download")
                 return f"Archive {filepath} not found"
         examples = process_archive_streaming(filepath, timeout=timeout)
         if examples:
@@ -212,7 +215,7 @@ def download_and_process(url: str, zips_dir: str, data_dir: str, timeout: float,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Построение датасета фич из архивов ордербуков (запись файлов производится прямо в дочерних процессах)."
+        description="Построение датасета фич из архивов ордербуков (использование потоков)."
     )
     parser.add_argument("--pair-index", type=int, default=None,
                         help="Индекс торговой пары из SYMBOLS (0-based). Если не указан – обрабатываются все пары.")
@@ -238,18 +241,19 @@ def main():
     os.makedirs(zips_dir, exist_ok=True)
     os.makedirs(data_dir, exist_ok=True)
 
-    num_workers = os.cpu_count() or 4
-    logging.info(f"Запуск обработки архивов в {num_workers} процессах.")
-    ctx = multiprocessing.get_context("spawn")
-    with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers, mp_context=ctx) as executor:
-        futures = [
-            executor.submit(download_and_process, url, zips_dir, data_dir, 30, args.download)
+    num_workers = min(len(all_urls), os.cpu_count() or 4)
+    logging.info(f"Запуск обработки архивов в {num_workers} потоках.")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+        future_to_url = {
+            executor.submit(download_and_process, url, zips_dir, data_dir, 30, args.download): url
             for url in all_urls
-        ]
-        for future in concurrent.futures.as_completed(futures):
-            result = future.result()
-            logging.info(f"Результат: {result}")
-
+        }
+        for future in concurrent.futures.as_completed(future_to_url):
+            try:
+                result = future.result()
+                logging.info(f"Результат: {result}")
+            except Exception as e:
+                logging.error(f"Ошибка получения результата из future: {e}")
+    
 if __name__ == "__main__":
-    multiprocessing.set_start_method("spawn", force=True)
     main()
