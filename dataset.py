@@ -249,13 +249,18 @@ def main():
     logging.info(f"Запуск обработки архивов в {num_workers} процессах.")
     ctx = multiprocessing.get_context("spawn")
     with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers, mp_context=ctx) as executor:
-        futures = [executor.submit(download_and_process, url, zips_dir, data_dir, 30, args.download) for url in all_urls]
+        futures = [
+            executor.submit(download_and_process, url, zips_dir, data_dir, 30, args.download)
+            for url in all_urls
+        ]
         for future in concurrent.futures.as_completed(futures):
-            try:
-                result = future.result()
-                logging.info(f"Результат: {result}")
-            except Exception as e:
-                logging.error(f"Ошибка получения результата из future: {e}")
+            exc = future.exception()
+            if exc is not None:
+                logging.error("Future raised an exception:")
+                logging.error(traceback.format_exception(type(exc), exc, exc.__traceback__))
+                continue
+            result = future.result()
+            logging.info(f"Результат: {result}")
     logging.info("Обработка завершена.")
 
 if __name__ == "__main__":
