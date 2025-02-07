@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
 """
-Построение датасета фич из архивов ордербуков.
-
-Для каждого URL архив сразу обрабатывается:
-  - Если архив отсутствует в папке zips и передан флаг --download, архив скачивается.
-  - Затем обработка (парсинг, сбор snapshot-ов, формирование обучающих примеров) запускается в отдельном процессе.
-  
-Многопроцессорность используется для полной загрузки всех CPU‑ядер при CPU‑интенсивной обработке.
+Построение датасета фич из архивов ордербуков с использованием ProcessPoolExecutor.
+Каждый URL обрабатывается в отдельном процессе:
+  - Если архив отсутствует и передан флаг --download, архив скачивается.
+  - Затем архив обрабатывается (парсинг, сбор snapshot-ов, формирование обучающих примеров).
 """
 
 import os
-import re
 import io
 import json
 import time
@@ -21,6 +17,7 @@ import logging
 import numpy as np
 from datetime import datetime, timedelta
 import concurrent.futures
+import traceback
 
 # Импортируем настройки и класс Orderbook
 from config import (
@@ -43,9 +40,6 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
-# =========================================================
-# Функция формирования URL-ов архивов для заданного диапазона и торговой пары
-# =========================================================
 def generate_date_urls(date_range: str, pair: str) -> list:
     """
     Для диапазона дат (строка "YYYY-MM-DD,YYYY-MM-DD") и торговой пары (без символа "/")
@@ -63,9 +57,6 @@ def generate_date_urls(date_range: str, pair: str) -> list:
         current_date += timedelta(days=1)
     return urls
 
-# =========================================================
-# Функция скачивания архива (если его ещё нет)
-# =========================================================
 def download_archive(url: str, zips_dir: str) -> str:
     """
     Скачивает архив по URL в папку zips_dir.
@@ -89,9 +80,6 @@ def download_archive(url: str, zips_dir: str) -> str:
         logging.error(f"Ошибка скачивания {url}: {e}")
         return None
 
-# =========================================================
-# Функция потоковой (на лету) обработки архива
-# =========================================================
 def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
     """
     Обрабатывает архив (zip‑файл) «на лету».
@@ -184,6 +172,7 @@ def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
                                         "features": features_vec,
                                         "target": np.float32(target_delta)
                                     })
+                                    logging.info(f"Сформирован обучающий пример (всего примеров: {len(training_examples)})")
                                     # Удаляем первый snapshot из очереди
                                     feature_queue.pop(0)
                                     last_generated_time = time.time()
@@ -198,14 +187,11 @@ def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
                             return training_examples
                 logging.info(f"Файл {filename}: обработано {line_count} строк.")
     except Exception as e:
-        logging.error(f"Ошибка при обработке архива {filepath}: {e}")
+        logging.error(f"Ошибка при обработке архива {filepath}: {traceback.format_exc()}")
         return training_examples
 
     return training_examples
 
-# =========================================================
-# Функция, объединяющая скачивание и обработку для одного URL
-# =========================================================
 def download_and_process(url: str, zips_dir: str, timeout: float, download: bool) -> tuple:
     """
     Для данного URL:
@@ -213,24 +199,25 @@ def download_and_process(url: str, zips_dir: str, timeout: float, download: bool
       - Если архив найден (или уже скачан), запускает его обработку.
       - Возвращает (archive_filename, training_examples) или None, если архив недоступен.
     """
-    filename = url.split("/")[-1]
-    filepath = os.path.join(zips_dir, filename)
-    if not os.path.exists(filepath):
-        if download:
-            filepath = download_archive(url, zips_dir)
-            if filepath is None:
-                logging.error(f"Не удалось скачать архив {url}")
+    try:
+        filename = url.split("/")[-1]
+        filepath = os.path.join(zips_dir, filename)
+        if not os.path.exists(filepath):
+            if download:
+                filepath = download_archive(url, zips_dir)
+                if filepath is None:
+                    logging.error(f"Не удалось скачать архив {url}")
+                    return None
+            else:
+                logging.warning(f"Архив {filepath} не найден. Для скачивания используйте флаг --download")
                 return None
-        else:
-            logging.warning(f"Архив {filepath} не найден. Для скачивания используйте флаг --download")
-            return None
 
-    examples = process_archive_streaming(filepath, timeout=timeout)
-    return (filename, examples)
+        examples = process_archive_streaming(filepath, timeout=timeout)
+        return (filename, examples)
+    except Exception:
+        logging.error(f"Ошибка в download_and_process для {url}: {traceback.format_exc()}")
+        return None
 
-# =========================================================
-# Главная функция
-# =========================================================
 def main():
     parser = argparse.ArgumentParser(
         description="Построение датасета фич из архивов ордербуков (обработка архивов в процессах)."
@@ -241,13 +228,11 @@ def main():
                         help="Скачивать архивы, если их нет в папке zips.")
     args = parser.parse_args()
 
-    # Определяем, какие торговые пары обрабатывать
     if args.pair_index is not None:
         selected_pairs = [SYMBOLS[args.pair_index]]
     else:
         selected_pairs = SYMBOLS
 
-    # Формируем список URL-ов архивов для выбранных пар и диапазонов дат
     all_urls = []
     for dr in TRAINING_DATE_RANGES:
         for sym in selected_pairs:
@@ -261,7 +246,7 @@ def main():
     os.makedirs(zips_dir, exist_ok=True)
     os.makedirs(data_dir, exist_ok=True)
 
-    # Многопроцессорная обработка архивов: сразу запускаем задачу для каждого URL
+    # Используем ProcessPoolExecutor для CPU-интенсивной обработки
     num_workers = os.cpu_count() or 4
     logging.info(f"Запуск обработки архивов в {num_workers} процессах.")
     with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
