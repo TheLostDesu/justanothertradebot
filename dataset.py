@@ -97,16 +97,29 @@ def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
     Алгоритм:
       1. Для каждой записи в архиве обновляется ордербук.
       2. В ордербуке накапливается последовательность snapshot‑ов (через update и internal sequence_history).
-      3. Когда длина последовательности достигает SEQUENCE_LENGTH, формируется обучающий пример:
-            – признаки: сохраняется окно из SEQUENCE_LENGTH snapshot‑ов (без flattening),
-            – цель: вычисляется как относительное изменение mid‑цены между первым и последним snapshot‑ом.
-         После формирования примера окно сдвигается (удаляя первый snapshot).
-      4. Если в течение timeout (30 сек) не появляется новый пример, возвращаются накопленные данные.
-      5. Дополнительно: сохраняются данные о свечах (candles), если они есть в features.
+      3. Когда в deque накоплено окно из SEQUENCE_LENGTH снапшотов, создаётся новый pending‑пример,
+         в который копируется это окно; для pending‑окна вычисляется target_time как время последнего
+         снапшота + TRAINING_HORIZON (например, 30 сек).
+      4. Если при получении нового обновления текущее время (ts) превышает target_time одного или
+         нескольких pending‑окон, для каждого из них завершается формирование обучающего примера:
+             – таргет считается как относительное изменение mid‑цены между первым значением окна и
+               текущей ценой (из обновлённого ордербука).
+      5. Обучающие примеры копируются в итоговый список.  
+         **Важно:** большее значение target рассчитывается для каждого pending‑окна независимо,
+         а очередь pending‑примеров позволяет иметь несколько ожидающих окон одновременно.
+      6. Если в течение timeout (например, 30 сек) не появляется ни одного нового примера, функция
+         завершает обработку и возвращает накопленные данные.
     """
+    from collections import deque  # для очереди pending_examples
+
     training_examples = []
     last_generated_time = time.time()
     ob = Orderbook()
+
+    # Очередь для ожидающих (pending) примеров
+    pending_examples = deque()
+    # Переменная для контроля, чтобы не создавать несколько pending‑примеров для одного и того же окна
+    last_pending_ts = None
 
     try:
         with zipfile.ZipFile(filepath, "r") as zf:
@@ -135,7 +148,6 @@ def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
                         r_type = record.get("type")
                         ts = record.get("ts")
 
-                        # Преобразуем ts в float, если возможно
                         try:
                             ts = float(ts)
                         except Exception:
@@ -144,31 +156,49 @@ def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
                         # Обновляем ордербук; внутри update() происходит накопление snapshot-ов
                         ob.update(data, r_type, timestamp=ts)
 
-                        # Получаем накопленные фичи (включая sequence и candles)
+                        # Получаем текущие фичи ордербука (включая sequence и candles)
                         features = ob.get_features()
                         sequence = features.get("sequence", [])
-                        candles = features.get("candles", [])  # <-- достаём свечи
+                        candles = features.get("candles", [])  # данные по свечам
 
-                        # Если накоплено достаточно snapshot-ов, формируем обучающий пример
+                        # Если накоплено достаточное окно, добавляем новый pending‑пример, если ещё не добавляли для этого окна
                         if len(sequence) >= SEQUENCE_LENGTH:
-                            window = sequence[-SEQUENCE_LENGTH:]
-                            first_mid = float(window[0].get("mid", 0))
-                            last_mid = float(window[-1].get("mid", 0))
-                            target_delta = ((last_mid - first_mid) / first_mid) if first_mid != 0 else 0.0
+                            # Ожидаем, что каждый snapshot содержит 'ts' (см. изменение get_snapshot_features)
+                            last_snapshot_ts = sequence[-1].get("ts")
+                            if last_snapshot_ts is not None:
+                                if last_pending_ts is None or last_snapshot_ts > last_pending_ts:
+                                    window = list(sequence)  # создаём копию окна
+                                    try:
+                                        baseline = float(window[0].get("mid", 0))
+                                    except Exception:
+                                        baseline = 0.0
+                                    pending_examples.append({
+                                        "window": window,
+                                        "baseline": baseline,
+                                        "target_time": float(last_snapshot_ts) + TRAINING_HORIZON
+                                    })
+                                    last_pending_ts = last_snapshot_ts
 
-                            # Пример сохраняет список snapshot-ов, данные по свечам и целевое значение
+                        # Проверяем очередь pending‑примеров и завершаем те, для которых наступило target_time
+                        while pending_examples and ts >= pending_examples[0]["target_time"]:
+                            pending = pending_examples.popleft()
+                            # Используем текущую mid‑цену (из последнего snapshot в текущем состоянии ордербука)
+                            try:
+                                current_mid = float(features["sequence"][-1].get("mid", 0))
+                            except Exception:
+                                current_mid = 0.0
+                            if pending["baseline"] != 0:
+                                target_delta = (current_mid - pending["baseline"]) / pending["baseline"]
+                            else:
+                                target_delta = 0.0
                             training_examples.append({
-                                "features": window,
-                                "candles": candles,  # <-- сохраняем свечи
+                                "features": pending["window"],
+                                "candles": candles,
                                 "target": np.float32(target_delta)
                             })
                             last_generated_time = time.time()
-
-                            # Сдвигаем окно, удаляя первый snapshot, чтобы сформировать новое
-                            if ob.sequence_history:
-                                ob.sequence_history.popleft()
-
-                        # Если давно не было новых примеров, выходим
+                        
+                        # Если давно не появлялось новое обновление, завершаем обработку
                         if time.time() - last_generated_time > timeout:
                             logging.info("Достигнут timeout (30 сек) – возвращаю накопленные примеры.")
                             return training_examples
@@ -202,7 +232,7 @@ def download_and_process(url: str, zips_dir: str, data_dir: str, timeout: float,
                 return f"Archive {filepath} not found"
         examples = process_archive_streaming(filepath, timeout=timeout)
         if examples:
-            X = np.stack([ex["features"] for ex in examples])
+            X = np.stack([np.concatenate(ex["features"], ex["candles"]) for ex in examples])
             Y = np.array([ex["target"] for ex in examples], dtype=np.float32)
             output_filename = os.path.splitext(filename)[0] + ".npz"
             output_path = os.path.join(data_dir, output_filename)
