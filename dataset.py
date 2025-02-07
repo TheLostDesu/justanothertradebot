@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Пример кода с многопоточностью и логированием прогресса обработки строк.
-Архивы скачиваются (если не обнаружены локально) и обрабатываются параллельно.
-В процессе обработки архивов выводятся сообщения вида:
-  "Обработано 1%, 5%, 10%, 20% ..." для каждого файла в архиве.
+Построение датасета фич из архивов ордербуков.
+
+— Скачивание архивов (если их ещё нет) происходит последовательно.
+— Обработка каждого архива (потоковая генерация обучающих примеров) выполняется в отдельном потоке.
 """
 
 import os
@@ -24,14 +24,14 @@ from config import (
     TRAINING_DATE_RANGES,   # например, ["2025-01-01,2025-01-07"]
     URL_TEMPLATE,           # "https://quote-saver.bycsi.com/orderbook/linear/{pair}/{date}_{pair}_ob500.data.zip"
     SYMBOLS,                # список, например, ["BTC/USDT", "ETH/USDT", ...]
-    SEQUENCE_LENGTH,        # длина окна (например, 3 или 4)
-    HORIZON_MS              # горизонт в секундах (в данном примере – 30)
+    SEQUENCE_LENGTH,        # длина окна (например, 3)
+    HORIZON_MS              # горизонт в секундах (например, 30)
 )
 from orderbook import Orderbook
 
-# Интервалы в секундах
-SNAPSHOT_INTERVAL = 10    # собираем snapshot каждые 10 секунд
-TRAINING_HORIZON  = 30    # через 30 секунд после появления первого snapshot‑а, известен исход
+# Интервалы (в секундах)
+SNAPSHOT_INTERVAL = 10    # делаем snapshot раз в 10 секунд
+TRAINING_HORIZON  = 30    # через 30 секунд после появления первого snapshot-а, считается исход
 
 # Настройка логирования
 logging.basicConfig(
@@ -40,12 +40,12 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
-# ---------------------------------------
-# Функция формирования URL-ов архивов
-# ---------------------------------------
+# =========================================================
+# Формирование URL архивов для заданного диапазона и торговой пары
+# =========================================================
 def generate_date_urls(date_range: str, pair: str) -> list:
     """
-    Для заданного диапазона дат (строка "YYYY-MM-DD,YYYY-MM-DD") и торговой пары (без символа "/")
+    Для диапазона дат (строка "YYYY-MM-DD,YYYY-MM-DD") и торговой пары (без символа "/")
     формирует список URL архивов.
     """
     start_str, end_str = date_range.split(',')
@@ -60,12 +60,12 @@ def generate_date_urls(date_range: str, pair: str) -> list:
         current_date += timedelta(days=1)
     return urls
 
-# ---------------------------------------
-# Функция скачивания архива (если он отсутствует)
-# ---------------------------------------
+# =========================================================
+# Скачивание архива (если его ещё нет)
+# =========================================================
 def download_archive(url: str, zips_dir: str) -> str:
     """
-    Скачивает архив по указанному URL в папку zips_dir.
+    Скачивает архив по URL в папку zips_dir.
     Если архив уже существует, возвращает путь к нему.
     """
     filename = url.split("/")[-1]
@@ -86,37 +86,37 @@ def download_archive(url: str, zips_dir: str) -> str:
         logging.error(f"Ошибка скачивания {url}: {e}")
         return None
 
-# ---------------------------------------
-# Функция обработки архива с потоковой генерацией примеров
-# ---------------------------------------
+# =========================================================
+# Обработка архива (потоковая генерация обучающих примеров)
+# Многопоточность применяется только на этом этапе.
+# =========================================================
 def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
     """
-    Обрабатывает архив (zip-файл) потоково.
-    
+    Обрабатывает архив (zip‑файл) потоково.
+
     Алгоритм:
-      1. Из записей архива обновляется Orderbook.
-      2. Раз в 10 секунд извлекается snapshot (фича) и добавляется в очередь.
-      3. Если время текущей записи (ts) >= времени первого snapshot-а + 30 сек и в очереди
-         накоплено не менее SEQUENCE_LENGTH snapshot-ов, формируется обучающий пример.
+      1. Читаем записи из архива и обновляем Orderbook.
+      2. Раз в SNAPSHOT_INTERVAL (10 сек) извлекается snapshot (фича) и добавляется в очередь.
+      3. Если время текущей записи (ts) >= времени первого snapshot-а + TRAINING_HORIZON (30 сек)
+         и в очереди накоплено не менее SEQUENCE_LENGTH snapshot‑ов, формируется обучающий пример:
+            – признаки: объединяем (flatten) первые SEQUENCE_LENGTH snapshot‑ов ([bid, ask, mid])
+            – цель: относительное изменение mid‑цены, вычисленное как (current_mid – candidate_mid) / candidate_mid.
          После формирования примера первый snapshot удаляется из очереди.
-      4. В процессе чтения каждого файла внутри архива ведётся логирование прогресса по количеству
-         обработанных байт (пороговые отметки: 1%, 5%, 10%, 20% ...).
-      5. Если в течение timeout (реального времени) не появляется новый пример, функция возвращает накопленные данные.
+      4. Если в течение timeout (30 сек) реального времени не появляется новый пример, возвращаются накопленные данные.
     """
     training_examples = []
-    feature_queue = []      # очередь snapshot-ов (каждый snapshot – dict с 'bid', 'ask', 'mid', 'ts')
-    last_snapshot_time = None  # для контроля интервала между snapshot-ами
+    feature_queue = []      # очередь snapshot‑ов (каждый snapshot – dict с 'bid', 'ask', 'mid', 'ts')
+    last_snapshot_time = None  # для контроля интервала между snapshot‑ами
     last_generated_time = time.time()
     ob = Orderbook()
 
     try:
         with zipfile.ZipFile(filepath, "r") as zf:
-            # Проходим по всем файлам внутри архива
             for filename in zf.namelist():
                 file_info = zf.getinfo(filename)
                 total_size = file_info.file_size
                 bytes_read = 0
-                logged_thresholds = set()  # для контроля, какие проценты уже залогированы
+                logged_thresholds = set()
 
                 logging.info(f"Обработка файла {filename} ({total_size} байт)...")
                 with zf.open(filename) as f:
@@ -124,14 +124,13 @@ def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
                     for line in f:
                         line_count += 1
                         bytes_read += len(line)
-                        # Вычисляем процент прочтения файла
+                        # Логирование прогресса по процентам
                         current_percentage = int((bytes_read / total_size) * 100)
-                        # Логгируем при прохождении порогов: 1%, 5%, 10%, 20%, 30%, ... 100%
                         for threshold in [1, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]:
                             if current_percentage >= threshold and threshold not in logged_thresholds:
                                 logging.info(f"Файл {filename}: обработано {threshold}%")
                                 logged_thresholds.add(threshold)
-                        
+
                         try:
                             record = json.loads(line.decode("utf-8").strip())
                         except Exception:
@@ -143,30 +142,28 @@ def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
                             ts = float(ts)
                         except Exception:
                             ts = time.time()
-                        
-                        # Обновляем ордербук; важно, чтобы Orderbook.update() раз в секунду сохранял snapshot,
-                        # а метод get_snapshot_features() возвращал словарь с [bid, ask, mid].
+
+                        # Обновляем Orderbook; предполагается, что Orderbook.update() раз в секунду
+                        # сохраняет snapshot, а get_snapshot_features() возвращает словарь с [bid, ask, mid]
                         ob.update(data, r_type, timestamp=ts)
-                        
-                        # Извлекаем snapshot из Orderbook.
+
+                        # Получаем snapshot из Orderbook и добавляем метку времени, если её нет
                         snap = ob.get_snapshot_features()
                         if snap is None:
                             continue
-                        # Добавляем в snapshot метку времени, если её нет
                         if "ts" not in snap:
                             snap["ts"] = ts
-                        
+
                         # Добавляем snapshot в очередь, если прошло не менее SNAPSHOT_INTERVAL секунд
                         if last_snapshot_time is None or (ts - last_snapshot_time) >= SNAPSHOT_INTERVAL:
                             feature_queue.append(snap)
                             last_snapshot_time = ts
                             logging.debug(f"Добавлен snapshot: ts={ts}")
-                        
-                        # Пытаемся сформировать обучающие примеры из очереди
+
+                        # Формируем обучающие примеры, если для первого snapshot-а прошёл TRAINING_HORIZON секунд
                         while feature_queue:
                             candidate = feature_queue[0]
                             if ts >= candidate["ts"] + TRAINING_HORIZON:
-                                # Если в очереди накоплено не менее SEQUENCE_LENGTH snapshot-ов, формируем пример
                                 if len(feature_queue) >= SEQUENCE_LENGTH:
                                     window = feature_queue[:SEQUENCE_LENGTH]
                                     lob_features = []
@@ -187,20 +184,18 @@ def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
                                         "features": features_vec,
                                         "target": np.float32(target_delta)
                                     })
-                                    logging.info(f"Сформирован обучающий пример ({len(training_examples)} всего).")
+                                    logging.info(f"Сформирован обучающий пример (всего примеров: {len(training_examples)})")
                                     # Удаляем первый snapshot из очереди
                                     feature_queue.pop(0)
                                     last_generated_time = time.time()
                                 else:
-                                    # Если в очереди недостаточно snapshot-ов, ждем следующего
                                     break
                             else:
                                 break
-                        
-                        # Если с момента формирования последнего примера прошло более timeout секунд (реального времени),
-                        # выходим, возвращая уже накопленные результаты.
+
+                        # Если с момента формирования последнего примера прошло больше timeout секунд, возвращаем накопленные примеры.
                         if time.time() - last_generated_time > timeout:
-                            logging.info("Достигнут timeout (30 сек) — возвращаю накопленные примеры.")
+                            logging.info("Достигнут timeout (30 сек) – возвращаю накопленные примеры.")
                             return training_examples
                 logging.info(f"Файл {filename}: обработано {line_count} строк.")
     except Exception as e:
@@ -209,12 +204,12 @@ def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
 
     return training_examples
 
-# ---------------------------------------
-# Главная функция: сбор URL-ов, загрузка архивов и многопоточная обработка
-# ---------------------------------------
+# =========================================================
+# Главная функция: скачивание архивов и их многопоточная обработка
+# =========================================================
 def main():
     parser = argparse.ArgumentParser(
-        description="Построение датасета фич из архивов ордербуков (многопоточная потоковая обработка)."
+        description="Построение датасета фич из архивов ордербуков (обработка архивов многопоточна)."
     )
     parser.add_argument("--pair-index", type=int, default=None,
                         help="Индекс торговой пары из SYMBOLS (0-based). Если не указан – обрабатываются все пары.")
@@ -228,7 +223,7 @@ def main():
     else:
         selected_pairs = SYMBOLS
 
-    # Формируем список URL-ов архивов для выбранных пар и диапазонов дат
+    # Формируем список URL архивов для выбранных пар и диапазонов дат
     all_urls = []
     for dr in TRAINING_DATE_RANGES:
         for sym in selected_pairs:
@@ -242,7 +237,7 @@ def main():
     os.makedirs(zips_dir, exist_ok=True)
     os.makedirs(data_dir, exist_ok=True)
 
-    # Сначала определяем пути к архивам (скачиваем, если необходимо)
+    # Скачивание архивов (последовательно)
     archive_paths = []
     for url in all_urls:
         archive_filename = url.split("/")[-1]
@@ -260,12 +255,14 @@ def main():
         logging.info("Нет архивов для обработки. Завершаем работу.")
         return
 
-    # Обработка архивов в нескольких потоках
+    # Обработка архивов с использованием многопоточности
     num_workers = min(len(archive_paths), os.cpu_count() or 4)
     logging.info(f"Запуск обработки архивов в {num_workers} потоках.")
     with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
-        future_to_archive = {executor.submit(process_archive_streaming, path, timeout=30): path
-                             for path in archive_paths}
+        future_to_archive = {
+            executor.submit(process_archive_streaming, path, timeout=30): path
+            for path in archive_paths
+        }
         for future in concurrent.futures.as_completed(future_to_archive):
             archive_path = future_to_archive[future]
             try:
