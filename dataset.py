@@ -92,21 +92,18 @@ def download_archive(url: str, zips_dir: str) -> str:
 
 def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
     """
-    Обрабатывает архив (zip‑файл) «на лету».
+    Обрабатывает архив (zip‑файл) «на лету» с использованием Orderbook.get_features().
 
     Алгоритм:
-      1. Из записей архива обновляется Orderbook.
-      2. Раз в SNAPSHOT_INTERVAL (10 сек) извлекается snapshot (фича) и добавляется в очередь.
-      3. Если время текущей записи (ts) >= времени первого snapshot‑а + TRAINING_HORIZON (30 сек)
-         и в очереди накоплено не менее SEQUENCE_LENGTH snapshot‑ов, формируется обучающий пример:
-            – признаки: объединяются (flatten) первые SEQUENCE_LENGTH snapshot‑ов ([bid, ask, mid])
-            – цель: относительное изменение mid‑цены, вычисляемое как (current_mid – candidate_mid) / candidate_mid.
-         После формирования примера первый snapshot удаляется из очереди.
+      1. Для каждой записи в архиве обновляется ордербук.
+      2. В ордербуке накапливается последовательность snapshot‑ов (через update и internal sequence_history).
+      3. Когда длина последовательности достигает SEQUENCE_LENGTH, формируется обучающий пример:
+            – признаки: сохраняется окно из SEQUENCE_LENGTH snapshot‑ов (без flattening),
+            – цель: вычисляется как относительное изменение mid‑цены между первым и последним snapshot‑ом.
+         После формирования примера окно сдвигается (удаляя первый snapshot).
       4. Если в течение timeout (30 сек) не появляется новый пример, возвращаются накопленные данные.
     """
     training_examples = []
-    feature_queue = []  # очередь snapshot‑ов, каждый snapshot – dict с 'bid', 'ask', 'mid', 'ts'
-    last_snapshot_time = None
     last_generated_time = time.time()
     ob = Orderbook()
 
@@ -121,7 +118,6 @@ def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
                 with zf.open(filename) as f:
                     for line in f:
                         bytes_read += len(line)
-                        # Логирование процента обработанных байт
                         current_percentage = int((bytes_read / total_size) * 100)
                         for threshold in [1, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]:
                             if current_percentage >= threshold and threshold not in logged_thresholds:
@@ -138,47 +134,39 @@ def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
                             ts = float(ts)
                         except Exception:
                             ts = time.time()
+
+                        # Обновляем ордербук; внутри update() происходит накопление snapshot-ов
                         ob.update(data, r_type, timestamp=ts)
-                        snap = ob.get_snapshot_features()
-                        if snap is None:
-                            continue
-                        if "ts" not in snap:
-                            snap["ts"] = ts
-                        if last_snapshot_time is None or (ts - last_snapshot_time) >= SNAPSHOT_INTERVAL:
-                            feature_queue.append(snap)
-                            last_snapshot_time = ts
-                        while feature_queue:
-                            candidate = feature_queue[0]
-                            if ts >= candidate["ts"] + TRAINING_HORIZON:
-                                if len(feature_queue) >= SEQUENCE_LENGTH:
-                                    window = feature_queue[:SEQUENCE_LENGTH]
-                                    lob_features = []
-                                    for s in window:
-                                        lob_features.extend([
-                                            float(s.get("bid", 0.0)),
-                                            float(s.get("ask", 0.0)),
-                                            float(s.get("mid", 0.0))
-                                        ])
-                                    features_vec = np.array(lob_features, dtype=np.float32)
-                                    candidate_mid = float(candidate.get("mid", 0))
-                                    current_mid = float(snap.get("mid", 0))
-                                    target_delta = ((current_mid - candidate_mid) / candidate_mid) if candidate_mid != 0 else 0.0
-                                    training_examples.append({
-                                        "features": features_vec,
-                                        "target": np.float32(target_delta)
-                                    })
-                                    feature_queue.pop(0)
-                                    last_generated_time = time.time()
-                                else:
-                                    break
-                            else:
-                                break
+
+                        # Получаем накопленные фичи (включая sequence и candles)
+                        features = ob.get_features()
+                        sequence = features.get("sequence", [])
+
+                        # Если накоплено достаточно snapshot-ов, формируем обучающий пример
+                        if len(sequence) >= SEQUENCE_LENGTH:
+                            window = sequence[-SEQUENCE_LENGTH:]
+                            first_mid = float(window[0].get("mid", 0))
+                            last_mid = float(window[-1].get("mid", 0))
+                            target_delta = ((last_mid - first_mid) / first_mid) if first_mid != 0 else 0.0
+
+                            # В обучающем примере просто сохраняем список snapshot-ов
+                            training_examples.append({
+                                "features": window,
+                                "target": np.float32(target_delta)
+                            })
+                            last_generated_time = time.time()
+
+                            # Сдвигаем окно, удаляя первый snapshot, чтобы сформировать новое окно для будущего примера
+                            if ob.sequence_history:
+                                ob.sequence_history.popleft()
+
                         if time.time() - last_generated_time > timeout:
                             logging.info("Достигнут timeout (30 сек) – возвращаю накопленные примеры.")
                             return training_examples
     except Exception as e:
         logging.error(f"Ошибка при обработке архива {filepath}: {traceback.format_exc()}")
         return training_examples
+
     return training_examples
 
 def download_and_process(url: str, zips_dir: str, data_dir: str, timeout: float, download: bool) -> str:
