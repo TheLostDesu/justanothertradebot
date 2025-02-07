@@ -184,7 +184,6 @@ def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
                                         "features": features_vec,
                                         "target": np.float32(target_delta)
                                     })
-                                    logging.info(f"Сформирован обучающий пример (всего примеров: {len(training_examples)})")
                                     # Удаляем первый snapshot из очереди
                                     feature_queue.pop(0)
                                     last_generated_time = time.time()
