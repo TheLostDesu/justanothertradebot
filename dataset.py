@@ -3,7 +3,9 @@
 Построение датасета фич из архивов ордербуков с использованием ProcessPoolExecutor.
 Каждый URL обрабатывается в отдельном процессе:
   - Если архив отсутствует и передан флаг --download, архив скачивается.
-  - Затем архив обрабатывается (парсинг, сбор snapshot-ов, формирование обучающих примеров).
+  - Затем архив обрабатывается (парсинг, сбор snapshot-ов, формирование обучающих примеров),
+    и результат (файл .npz) сохраняется прямо внутри дочернего процесса.
+  - В качестве результата возвращается только строка с информацией.
 """
 
 import os
@@ -42,6 +44,10 @@ logging.basicConfig(
 )
 
 def generate_date_urls(date_range: str, pair: str) -> list:
+    """
+    Для диапазона дат (строка "YYYY-MM-DD,YYYY-MM-DD") и торговой пары (без символа "/")
+    формирует список URL архивов.
+    """
     start_str, end_str = date_range.split(',')
     start_date = datetime.strptime(start_str.strip(), "%Y-%m-%d")
     end_date   = datetime.strptime(end_str.strip(), "%Y-%m-%d")
@@ -55,6 +61,10 @@ def generate_date_urls(date_range: str, pair: str) -> list:
     return urls
 
 def download_archive(url: str, zips_dir: str) -> str:
+    """
+    Скачивает архив по URL в папку zips_dir.
+    Если архив уже существует, возвращает путь к нему.
+    """
     filename = url.split("/")[-1]
     filepath = os.path.join(zips_dir, filename)
     if os.path.exists(filepath):
@@ -73,11 +83,26 @@ def download_archive(url: str, zips_dir: str) -> str:
         return None
 
 def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
+    """
+    Обрабатывает архив (zip‑файл) «на лету».
+
+    Алгоритм:
+      1. Из записей архива обновляется Orderbook.
+      2. Раз в SNAPSHOT_INTERVAL (10 сек) извлекается snapshot (фича) и добавляется в очередь.
+      3. Если время текущей записи (ts) >= времени первого snapshot-а + TRAINING_HORIZON (30 сек)
+         и в очереди накоплено не менее SEQUENCE_LENGTH snapshot‑ов, формируется обучающий пример:
+            – признаки: объединяются (flatten) первые SEQUENCE_LENGTH snapshot‑ов ([bid, ask, mid])
+            – цель: относительное изменение mid‑цены, вычисляемое как (current_mid – candidate_mid) / candidate_mid.
+         После формирования примера первый snapshot удаляется из очереди.
+      4. Если в течение timeout (30 сек) реального времени не появляется новый пример,
+         возвращаются накопленные данные.
+    """
     training_examples = []
-    feature_queue = []      
+    feature_queue = []      # очередь snapshot‑ов (каждый snapshot – dict с 'bid', 'ask', 'mid', 'ts')
     last_snapshot_time = None  
     last_generated_time = time.time()
     ob = Orderbook()
+
     try:
         with zipfile.ZipFile(filepath, "r") as zf:
             for filename in zf.namelist():
@@ -149,7 +174,14 @@ def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
         return training_examples
     return training_examples
 
-def download_and_process(url: str, zips_dir: str, timeout: float, download: bool) -> tuple:
+def download_and_process(url: str, zips_dir: str, data_dir: str, timeout: float, download: bool) -> str:
+    """
+    Для данного URL:
+      - Если архив отсутствует и download=True, скачивает архив.
+      - Если архив найден (или уже скачан), запускает его обработку.
+      - Если сформированы обучающие примеры, записывает .npz файл прямо в data_dir.
+      - Возвращает строку с результатом.
+    """
     try:
         filename = url.split("/")[-1]
         filepath = os.path.join(zips_dir, filename)
@@ -158,19 +190,29 @@ def download_and_process(url: str, zips_dir: str, timeout: float, download: bool
                 filepath = download_archive(url, zips_dir)
                 if filepath is None:
                     logging.error(f"Не удалось скачать архив {url}")
-                    return None
+                    return f"Archive {url} failed download"
             else:
                 logging.warning(f"Архив {filepath} не найден. Для скачивания используйте флаг --download")
-                return None
+                return f"Archive {filepath} not found"
         examples = process_archive_streaming(filepath, timeout=timeout)
-        return (filename, examples)
+        if examples:
+            X = np.stack([ex["features"] for ex in examples])
+            Y = np.array([ex["target"] for ex in examples], dtype=np.float32)
+            output_filename = os.path.splitext(filename)[0] + ".npz"
+            output_path = os.path.join(data_dir, output_filename)
+            np.savez_compressed(output_path, X=X, Y=Y)
+            logging.info(f"Сохранён датасет: {output_path} (образцов: {X.shape[0]})")
+            return f"Processed: {output_path}"
+        else:
+            logging.info(f"Для архива {filename} не сформировано обучающих примеров.")
+            return f"No examples for {filename}"
     except Exception:
         logging.error(f"Ошибка в download_and_process для {url}: {traceback.format_exc()}")
-        return None
+        return f"Error processing {url}"
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Построение датасета фич из архивов ордербуков (обработка архивов в процессах)."
+        description="Построение датасета фич из архивов ордербуков (запись файлов производится прямо в дочерних процессах)."
     )
     parser.add_argument("--pair-index", type=int, default=None,
                         help="Индекс торговой пары из SYMBOLS (0-based). Если не указан – обрабатываются все пары.")
@@ -200,27 +242,14 @@ def main():
     logging.info(f"Запуск обработки архивов в {num_workers} процессах.")
     ctx = multiprocessing.get_context("spawn")
     with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers, mp_context=ctx) as executor:
-        future_to_url = {
-            executor.submit(download_and_process, url, zips_dir, 30, args.download): url
+        futures = [
+            executor.submit(download_and_process, url, zips_dir, data_dir, 30, args.download)
             for url in all_urls
-        }
-        for future in concurrent.futures.as_completed(future_to_url):
-            url = future_to_url[future]
+        ]
+        for future in concurrent.futures.as_completed(futures):
             result = future.result()
-            if result is None:
-                continue
-            archive_filename, examples = result
-            if examples:
-                X = np.stack([ex["features"] for ex in examples])
-                Y = np.array([ex["target"] for ex in examples], dtype=np.float32)
-                output_filename = os.path.splitext(archive_filename)[0] + ".npz"
-                output_path = os.path.join(data_dir, output_filename)
-                np.savez_compressed(output_path, X=X, Y=Y)
-                logging.info(f"Сохранён датасет: {output_path} (образцов: {X.shape[0]})")
-            else:
-                logging.info(f"Для архива {archive_filename} не сформировано обучающих примеров.")
+            logging.info(f"Результат: {result}")
 
 if __name__ == "__main__":
-    # Принудительно используем метод 'spawn' для запуска процессов
     multiprocessing.set_start_method("spawn", force=True)
     main()
