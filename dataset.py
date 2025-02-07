@@ -111,9 +111,7 @@ def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
 
                 logging.info(f"Обработка файла {filename} ({total_size} байт)...")
                 with zf.open(filename) as f:
-                    line_count = 0
                     for line in f:
-                        line_count += 1
                         bytes_read += len(line)
                         # Логирование процента обработанных байт
                         current_percentage = int((bytes_read / total_size) * 100)
@@ -185,7 +183,6 @@ def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
                         if time.time() - last_generated_time > timeout:
                             logging.info("Достигнут timeout (30 сек) – возвращаю накопленные примеры.")
                             return training_examples
-                logging.info(f"Файл {filename}: обработано {line_count} строк.")
     except Exception as e:
         logging.error(f"Ошибка при обработке архива {filepath}: {traceback.format_exc()}")
         return training_examples
