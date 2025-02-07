@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """
-Построение датасета фич из архивов ордербуков с использованием ThreadPoolExecutor.
-
-Каждый URL обрабатывается в отдельном потоке:
-  - Если архив отсутствует в папке zips и передан флаг --download, архив скачивается.
-  - Архив обрабатывается «на лету»: из записей формируются snapshot‑ы с интервалом 10 сек,
+Построение датасета фич из архивов ордербуков с использованием ProcessPoolExecutor на UNIX.
+Каждый URL обрабатывается в отдельном процессе:
+  - Если архив отсутствует и передан флаг --download, архив скачивается.
+  - Далее архив обрабатывается «на лету»: из записей формируются snapshot‑ы с интервалом 10 сек,
     и когда для первого snapshot‑а проходит 30 сек, формируется обучающий пример.
-  - Если обучающие примеры сформированы, .npz файл записывается в папку data.
-  - Результатом работы каждого потока является строка с информацией о выполненной задаче.
+  - Если обучающие примеры сформированы, .npz‑файл сохраняется в папку data.
+  - Рабочий процесс возвращает простую строку с результатом.
+  
+Обратите внимание:
+  • Все функции определены на глобальном уровне (это необходимо для pickle).
+  • Используется метод запуска «spawn», что позволяет избежать проблем с наследованием состояния в UNIX.
+  • При получении результатов из пула добавлены try/except, чтобы ошибки (например, BrokenProcessPool)
+    не приводили к аварийному завершению всего скрипта.
 """
 
 import os
@@ -22,21 +27,22 @@ import numpy as np
 from datetime import datetime, timedelta
 import concurrent.futures
 import traceback
+import multiprocessing
 
 # Импортируем настройки и класс Orderbook.
 # Убедитесь, что модуль config и класс Orderbook определены на уровне модуля.
 from config import (
     TRAINING_DATE_RANGES,   # например, ["2025-01-01,2025-01-07"]
-    URL_TEMPLATE,           # например, "https://quote-saver.bycsi.com/orderbook/linear/{pair}/{date}_{pair}_ob500.data.zip"
+    URL_TEMPLATE,           # "https://quote-saver.bycsi.com/orderbook/linear/{pair}/{date}_{pair}_ob500.data.zip"
     SYMBOLS,                # список, например, ["BTC/USDT", "ETH/USDT", …]
     SEQUENCE_LENGTH,        # длина окна (например, 3)
     HORIZON_MS              # горизонт в секундах (например, 30)
 )
 from orderbook import Orderbook
 
-# Интервалы (в секундах)
-SNAPSHOT_INTERVAL = 10    # собираем snapshot раз в 10 секунд
-TRAINING_HORIZON  = 30    # через 30 секунд после появления первого snapshot‑а считается исход
+# Параметры интервалов (в секундах)
+SNAPSHOT_INTERVAL = 10    # собираем snapshot раз в 10 сек
+TRAINING_HORIZON  = 30    # через 30 сек после появления первого snapshot‑а считается исход
 
 # Настройка логирования
 logging.basicConfig(
@@ -47,7 +53,7 @@ logging.basicConfig(
 
 def generate_date_urls(date_range: str, pair: str) -> list:
     """
-    Для диапазона дат (например, "2025-01-01,2025-01-07") и торговой пары (без символа "/")
+    Для заданного диапазона дат (строка "YYYY-MM-DD,YYYY-MM-DD") и торговой пары (без символа "/")
     формирует список URL архивов.
     """
     start_str, end_str = date_range.split(',')
@@ -72,7 +78,6 @@ def download_archive(url: str, zips_dir: str) -> str:
     if os.path.exists(filepath):
         logging.info(f"Архив уже существует: {filepath}")
         return filepath
-
     logging.info(f"Скачиваем {url} ...")
     try:
         resp = requests.get(url)
@@ -97,11 +102,10 @@ def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
             – признаки: объединяются (flatten) первые SEQUENCE_LENGTH snapshot‑ов ([bid, ask, mid])
             – цель: относительное изменение mid‑цены, вычисляемое как (current_mid – candidate_mid) / candidate_mid.
          После формирования примера первый snapshot удаляется из очереди.
-      4. Если в течение timeout (30 сек) реального времени не появляется новый пример,
-         возвращаются накопленные данные.
+      4. Если в течение timeout (30 сек) не появляется новый пример, возвращаются накопленные данные.
     """
     training_examples = []
-    feature_queue = []      # очередь snapshot‑ов (каждый snapshot – dict с ключами 'bid', 'ask', 'mid', 'ts')
+    feature_queue = []  # очередь snapshot‑ов, каждый snapshot – dict с 'bid', 'ask', 'mid', 'ts'
     last_snapshot_time = None
     last_generated_time = time.time()
     ob = Orderbook()
@@ -117,6 +121,7 @@ def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
                 with zf.open(filename) as f:
                     for line in f:
                         bytes_read += len(line)
+                        # Логирование процента обработанных байт
                         current_percentage = int((bytes_read / total_size) * 100)
                         for threshold in [1, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]:
                             if current_percentage >= threshold and threshold not in logged_thresholds:
@@ -148,17 +153,16 @@ def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
                                 if len(feature_queue) >= SEQUENCE_LENGTH:
                                     window = feature_queue[:SEQUENCE_LENGTH]
                                     lob_features = []
-                                    for snap_in_window in window:
+                                    for s in window:
                                         lob_features.extend([
-                                            float(snap_in_window.get("bid", 0.0)),
-                                            float(snap_in_window.get("ask", 0.0)),
-                                            float(snap_in_window.get("mid", 0.0))
+                                            float(s.get("bid", 0.0)),
+                                            float(s.get("ask", 0.0)),
+                                            float(s.get("mid", 0.0))
                                         ])
                                     features_vec = np.array(lob_features, dtype=np.float32)
                                     candidate_mid = float(candidate.get("mid", 0))
                                     current_mid = float(snap.get("mid", 0))
-                                    target_delta = ((current_mid - candidate_mid) / candidate_mid
-                                                    if candidate_mid != 0 else 0.0)
+                                    target_delta = ((current_mid - candidate_mid) / candidate_mid) if candidate_mid != 0 else 0.0
                                     training_examples.append({
                                         "features": features_vec,
                                         "target": np.float32(target_delta)
@@ -180,10 +184,10 @@ def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
 def download_and_process(url: str, zips_dir: str, data_dir: str, timeout: float, download: bool) -> str:
     """
     Для данного URL:
-      - Если архив отсутствует и download=True, скачивает архив.
-      - Если архив найден (или уже скачан), обрабатывает его.
-      - Если сформированы обучающие примеры, записывает .npz файл в data_dir.
-      - Возвращает строку с результатом.
+      - Если архив отсутствует и download=True, архив скачивается.
+      - Если архив найден (или уже скачан), запускается его обработка.
+      - Если сформированы обучающие примеры, .npz‑файл записывается в data_dir.
+      - Возвращается строка с результатом.
     """
     try:
         filename = url.split("/")[-1]
@@ -215,10 +219,10 @@ def download_and_process(url: str, zips_dir: str, data_dir: str, timeout: float,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Построение датасета фич из архивов ордербуков (использование потоков)."
+        description="Построение датасета из архивов ордербуков (ProcessPoolExecutor, UNIX)"
     )
     parser.add_argument("--pair-index", type=int, default=None,
-                        help="Индекс торговой пары из SYMBOLS (0-based). Если не указан – обрабатываются все пары.")
+                        help="Индекс торговой пары из SYMBOLS (0-based). Если не указан, обрабатываются все пары.")
     parser.add_argument("--download", action="store_true",
                         help="Скачивать архивы, если их нет в папке zips.")
     args = parser.parse_args()
@@ -241,19 +245,19 @@ def main():
     os.makedirs(zips_dir, exist_ok=True)
     os.makedirs(data_dir, exist_ok=True)
 
-    num_workers = min(len(all_urls), os.cpu_count() or 4)
-    logging.info(f"Запуск обработки архивов в {num_workers} потоках.")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
-        future_to_url = {
-            executor.submit(download_and_process, url, zips_dir, data_dir, 30, args.download): url
-            for url in all_urls
-        }
-        for future in concurrent.futures.as_completed(future_to_url):
+    num_workers = os.cpu_count() or 4
+    logging.info(f"Запуск обработки архивов в {num_workers} процессах.")
+    ctx = multiprocessing.get_context("spawn")
+    with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers, mp_context=ctx) as executor:
+        futures = [executor.submit(download_and_process, url, zips_dir, data_dir, 30, args.download) for url in all_urls]
+        for future in concurrent.futures.as_completed(futures):
             try:
                 result = future.result()
                 logging.info(f"Результат: {result}")
             except Exception as e:
                 logging.error(f"Ошибка получения результата из future: {e}")
+    logging.info("Обработка завершена.")
 
 if __name__ == "__main__":
+    multiprocessing.set_start_method("spawn", force=True)
     main()
