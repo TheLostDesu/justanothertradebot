@@ -18,6 +18,7 @@ import numpy as np
 from datetime import datetime, timedelta
 import concurrent.futures
 import traceback
+import multiprocessing
 
 # Импортируем настройки и класс Orderbook
 from config import (
@@ -41,10 +42,6 @@ logging.basicConfig(
 )
 
 def generate_date_urls(date_range: str, pair: str) -> list:
-    """
-    Для диапазона дат (строка "YYYY-MM-DD,YYYY-MM-DD") и торговой пары (без символа "/")
-    формирует список URL архивов.
-    """
     start_str, end_str = date_range.split(',')
     start_date = datetime.strptime(start_str.strip(), "%Y-%m-%d")
     end_date   = datetime.strptime(end_str.strip(), "%Y-%m-%d")
@@ -58,16 +55,11 @@ def generate_date_urls(date_range: str, pair: str) -> list:
     return urls
 
 def download_archive(url: str, zips_dir: str) -> str:
-    """
-    Скачивает архив по URL в папку zips_dir.
-    Если архив уже существует, возвращает путь к нему.
-    """
     filename = url.split("/")[-1]
     filepath = os.path.join(zips_dir, filename)
     if os.path.exists(filepath):
         logging.info(f"Архив уже существует: {filepath}")
         return filepath
-
     logging.info(f"Скачиваем {url} ...")
     try:
         resp = requests.get(url)
@@ -81,26 +73,11 @@ def download_archive(url: str, zips_dir: str) -> str:
         return None
 
 def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
-    """
-    Обрабатывает архив (zip‑файл) «на лету».
-
-    Алгоритм:
-      1. Из записей архива обновляется Orderbook.
-      2. Раз в SNAPSHOT_INTERVAL (10 сек) извлекается snapshot (фича) и добавляется в очередь.
-      3. Если время текущей записи (ts) >= времени первого snapshot-а + TRAINING_HORIZON (30 сек)
-         и в очереди накоплено не менее SEQUENCE_LENGTH snapshot‑ов, формируется обучающий пример:
-            – признаки: объединяются (flatten) первые SEQUENCE_LENGTH snapshot‑ов ([bid, ask, mid])
-            – цель: относительное изменение mid‑цены, вычисляемое как (current_mid – candidate_mid) / candidate_mid.
-         После формирования примера первый snapshot удаляется из очереди.
-      4. Если в течение timeout (30 сек) реального времени не появляется новый пример,
-         возвращаются накопленные данные.
-    """
     training_examples = []
-    feature_queue = []      # очередь snapshot‑ов (каждый snapshot – dict с 'bid', 'ask', 'mid', 'ts')
-    last_snapshot_time = None  # для контроля интервала между snapshot‑ами
+    feature_queue = []      
+    last_snapshot_time = None  
     last_generated_time = time.time()
     ob = Orderbook()
-
     try:
         with zipfile.ZipFile(filepath, "r") as zf:
             for filename in zf.namelist():
@@ -108,18 +85,15 @@ def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
                 total_size = file_info.file_size
                 bytes_read = 0
                 logged_thresholds = set()
-
                 logging.info(f"Обработка файла {filename} ({total_size} байт)...")
                 with zf.open(filename) as f:
                     for line in f:
                         bytes_read += len(line)
-                        # Логирование процента обработанных байт
                         current_percentage = int((bytes_read / total_size) * 100)
                         for threshold in [1, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]:
                             if current_percentage >= threshold and threshold not in logged_thresholds:
                                 logging.info(f"Файл {filename}: обработано {threshold}%")
                                 logged_thresholds.add(threshold)
-
                         try:
                             record = json.loads(line.decode("utf-8").strip())
                         except Exception:
@@ -131,24 +105,15 @@ def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
                             ts = float(ts)
                         except Exception:
                             ts = time.time()
-
-                        # Обновляем Orderbook (предполагается, что Orderbook.update() раз в секунду сохраняет snapshot)
                         ob.update(data, r_type, timestamp=ts)
-
-                        # Получаем snapshot из Orderbook и добавляем метку времени, если её нет
                         snap = ob.get_snapshot_features()
                         if snap is None:
                             continue
                         if "ts" not in snap:
                             snap["ts"] = ts
-
-                        # Добавляем snapshot в очередь, если прошло не менее SNAPSHOT_INTERVAL секунд
                         if last_snapshot_time is None or (ts - last_snapshot_time) >= SNAPSHOT_INTERVAL:
                             feature_queue.append(snap)
                             last_snapshot_time = ts
-                            logging.debug(f"Добавлен snapshot: ts={ts}")
-
-                        # Формируем обучающие примеры из очереди, если для первого snapshot-а прошло TRAINING_HORIZON секунд
                         while feature_queue:
                             candidate = feature_queue[0]
                             if ts >= candidate["ts"] + TRAINING_HORIZON:
@@ -170,31 +135,21 @@ def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
                                         "features": features_vec,
                                         "target": np.float32(target_delta)
                                     })
-                                    # Удаляем первый snapshot из очереди
                                     feature_queue.pop(0)
                                     last_generated_time = time.time()
                                 else:
                                     break
                             else:
                                 break
-
-                        # Если с момента формирования последнего примера прошло больше timeout секунд, выходим.
                         if time.time() - last_generated_time > timeout:
                             logging.info("Достигнут timeout (30 сек) – возвращаю накопленные примеры.")
                             return training_examples
     except Exception as e:
         logging.error(f"Ошибка при обработке архива {filepath}: {traceback.format_exc()}")
         return training_examples
-
     return training_examples
 
 def download_and_process(url: str, zips_dir: str, timeout: float, download: bool) -> tuple:
-    """
-    Для данного URL:
-      - Если архив отсутствует и download=True, скачивает архив.
-      - Если архив найден (или уже скачан), запускает его обработку.
-      - Возвращает (archive_filename, training_examples) или None, если архив недоступен.
-    """
     try:
         filename = url.split("/")[-1]
         filepath = os.path.join(zips_dir, filename)
@@ -207,7 +162,6 @@ def download_and_process(url: str, zips_dir: str, timeout: float, download: bool
             else:
                 logging.warning(f"Архив {filepath} не найден. Для скачивания используйте флаг --download")
                 return None
-
         examples = process_archive_streaming(filepath, timeout=timeout)
         return (filename, examples)
     except Exception:
@@ -242,10 +196,10 @@ def main():
     os.makedirs(zips_dir, exist_ok=True)
     os.makedirs(data_dir, exist_ok=True)
 
-    # Используем ProcessPoolExecutor для CPU-интенсивной обработки
     num_workers = os.cpu_count() or 4
     logging.info(f"Запуск обработки архивов в {num_workers} процессах.")
-    with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
+    ctx = multiprocessing.get_context("spawn")
+    with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers, mp_context=ctx) as executor:
         future_to_url = {
             executor.submit(download_and_process, url, zips_dir, 30, args.download): url
             for url in all_urls
@@ -267,4 +221,6 @@ def main():
                 logging.info(f"Для архива {archive_filename} не сформировано обучающих примеров.")
 
 if __name__ == "__main__":
+    # Принудительно используем метод 'spawn' для запуска процессов
+    multiprocessing.set_start_method("spawn", force=True)
     main()
