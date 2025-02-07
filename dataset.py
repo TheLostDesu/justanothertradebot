@@ -2,8 +2,10 @@
 """
 Построение датасета фич из архивов ордербуков.
 
-— Скачивание архивов (если их ещё нет) происходит последовательно.
-— Обработка каждого архива (потоковая генерация обучающих примеров) выполняется в отдельном потоке.
+Для каждого URL архив обрабатывается сразу:
+  - Если архив отсутствует, он скачивается (при переданном флаге --download).
+  - Обработка (парсинг, сбор snapshot-ов и формирование обучающих примеров) запускается в отдельном потоке.
+  - Многопоточность применяется только на этапе обработки архивов.
 """
 
 import os
@@ -31,7 +33,7 @@ from orderbook import Orderbook
 
 # Интервалы (в секундах)
 SNAPSHOT_INTERVAL = 10    # делаем snapshot раз в 10 секунд
-TRAINING_HORIZON  = 30    # через 30 секунд после появления первого snapshot-а, считается исход
+TRAINING_HORIZON  = 30    # через 30 секунд после появления первого snapshot-а считается исход
 
 # Настройка логирования
 logging.basicConfig(
@@ -41,7 +43,7 @@ logging.basicConfig(
 )
 
 # =========================================================
-# Формирование URL архивов для заданного диапазона и торговой пары
+# Формирование URL-ов архивов для заданного диапазона и торговой пары
 # =========================================================
 def generate_date_urls(date_range: str, pair: str) -> list:
     """
@@ -61,7 +63,7 @@ def generate_date_urls(date_range: str, pair: str) -> list:
     return urls
 
 # =========================================================
-# Скачивание архива (если его ещё нет)
+# Функция скачивания архива (если его ещё нет)
 # =========================================================
 def download_archive(url: str, zips_dir: str) -> str:
     """
@@ -87,8 +89,7 @@ def download_archive(url: str, zips_dir: str) -> str:
         return None
 
 # =========================================================
-# Обработка архива (потоковая генерация обучающих примеров)
-# Многопоточность применяется только на этом этапе.
+# Функция потоковой обработки архива
 # =========================================================
 def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
     """
@@ -102,7 +103,8 @@ def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
             – признаки: объединяем (flatten) первые SEQUENCE_LENGTH snapshot‑ов ([bid, ask, mid])
             – цель: относительное изменение mid‑цены, вычисленное как (current_mid – candidate_mid) / candidate_mid.
          После формирования примера первый snapshot удаляется из очереди.
-      4. Если в течение timeout (30 сек) реального времени не появляется новый пример, возвращаются накопленные данные.
+      4. Если в течение timeout (30 сек) реального времени не появляется новый пример,
+         возвращаются накопленные данные.
     """
     training_examples = []
     feature_queue = []      # очередь snapshot‑ов (каждый snapshot – dict с 'bid', 'ask', 'mid', 'ts')
@@ -147,7 +149,7 @@ def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
                         # сохраняет snapshot, а get_snapshot_features() возвращает словарь с [bid, ask, mid]
                         ob.update(data, r_type, timestamp=ts)
 
-                        # Получаем snapshot из Orderbook и добавляем метку времени, если её нет
+                        # Получаем snapshot и добавляем метку времени (если её нет)
                         snap = ob.get_snapshot_features()
                         if snap is None:
                             continue
@@ -160,7 +162,7 @@ def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
                             last_snapshot_time = ts
                             logging.debug(f"Добавлен snapshot: ts={ts}")
 
-                        # Формируем обучающие примеры, если для первого snapshot-а прошёл TRAINING_HORIZON секунд
+                        # Формируем обучающие примеры, если для первого snapshot-а прошло TRAINING_HORIZON секунд
                         while feature_queue:
                             candidate = feature_queue[0]
                             if ts >= candidate["ts"] + TRAINING_HORIZON:
@@ -176,10 +178,8 @@ def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
                                     features_vec = np.array(lob_features, dtype=np.float32)
                                     candidate_mid = float(candidate.get("mid", 0))
                                     current_mid = float(snap.get("mid", 0))
-                                    if candidate_mid != 0:
-                                        target_delta = (current_mid - candidate_mid) / candidate_mid
-                                    else:
-                                        target_delta = 0.0
+                                    target_delta = ((current_mid - candidate_mid) / candidate_mid
+                                                    if candidate_mid != 0 else 0.0)
                                     training_examples.append({
                                         "features": features_vec,
                                         "target": np.float32(target_delta)
@@ -193,7 +193,7 @@ def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
                             else:
                                 break
 
-                        # Если с момента формирования последнего примера прошло больше timeout секунд, возвращаем накопленные примеры.
+                        # Если с момента формирования последнего примера прошло больше timeout секунд, выходим.
                         if time.time() - last_generated_time > timeout:
                             logging.info("Достигнут timeout (30 сек) – возвращаю накопленные примеры.")
                             return training_examples
@@ -205,11 +205,37 @@ def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
     return training_examples
 
 # =========================================================
-# Главная функция: скачивание архивов и их многопоточная обработка
+# Функция, объединяющая скачивание и обработку для одного URL
+# =========================================================
+def download_and_process(url: str, zips_dir: str, timeout: float, download: bool) -> tuple:
+    """
+    Для данного URL:
+      - Проверяет наличие локального архива.
+      - Если отсутствует и download=True, скачивает архив.
+      - Если архив найден, запускает его обработку и возвращает (archive_filename, training_examples).
+      - Если архив не найден и download=False, возвращается None.
+    """
+    filename = url.split("/")[-1]
+    filepath = os.path.join(zips_dir, filename)
+    if not os.path.exists(filepath):
+        if download:
+            filepath = download_archive(url, zips_dir)
+            if filepath is None:
+                logging.error(f"Не удалось скачать архив {url}")
+                return None
+        else:
+            logging.warning(f"Архив {filepath} не найден. Для скачивания используйте флаг --download")
+            return None
+
+    examples = process_archive_streaming(filepath, timeout=timeout)
+    return (filename, examples)
+
+# =========================================================
+# Главная функция
 # =========================================================
 def main():
     parser = argparse.ArgumentParser(
-        description="Построение датасета фич из архивов ордербуков (обработка архивов многопоточна)."
+        description="Построение датасета фич из архивов ордербуков (обработка архивов многопоточная)."
     )
     parser.add_argument("--pair-index", type=int, default=None,
                         help="Индекс торговой пары из SYMBOLS (0-based). Если не указан – обрабатываются все пары.")
@@ -217,13 +243,13 @@ def main():
                         help="Скачивать архивы, если их нет в папке zips.")
     args = parser.parse_args()
 
-    # Определяем, какие торговые пары обрабатывать
+    # Определяем, какие торговые пары обрабатывать.
     if args.pair_index is not None:
         selected_pairs = [SYMBOLS[args.pair_index]]
     else:
         selected_pairs = SYMBOLS
 
-    # Формируем список URL архивов для выбранных пар и диапазонов дат
+    # Формируем список URL-ов архивов для выбранных пар и диапазонов дат.
     all_urls = []
     for dr in TRAINING_DATE_RANGES:
         for sym in selected_pairs:
@@ -237,41 +263,22 @@ def main():
     os.makedirs(zips_dir, exist_ok=True)
     os.makedirs(data_dir, exist_ok=True)
 
-    # Скачивание архивов (последовательно)
-    archive_paths = []
-    for url in all_urls:
-        archive_filename = url.split("/")[-1]
-        archive_path = os.path.join(zips_dir, archive_filename)
-        if not os.path.exists(archive_path):
-            if args.download:
-                archive_path = download_archive(url, zips_dir)
-            else:
-                logging.warning(f"Архив не найден: {archive_path}. Для скачивания используйте флаг --download")
-                continue
-        if archive_path is not None:
-            archive_paths.append(archive_path)
-
-    if not archive_paths:
-        logging.info("Нет архивов для обработки. Завершаем работу.")
-        return
-
-    # Обработка архивов с использованием многопоточности
-    num_workers = min(len(archive_paths), os.cpu_count() or 4)
+    # Многопоточная обработка архивов: для каждого URL сразу запускается задача, которая скачивает (если нужно)
+    # и обрабатывает архив.
+    num_workers = min(len(all_urls), os.cpu_count() or 4)
     logging.info(f"Запуск обработки архивов в {num_workers} потоках.")
     with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
-        future_to_archive = {
-            executor.submit(process_archive_streaming, path, timeout=30): path
-            for path in archive_paths
+        # Создаём задачи для каждого URL
+        future_to_url = {
+            executor.submit(download_and_process, url, zips_dir, timeout=30, download=args.download): url
+            for url in all_urls
         }
-        for future in concurrent.futures.as_completed(future_to_archive):
-            archive_path = future_to_archive[future]
-            try:
-                examples = future.result()
-            except Exception as exc:
-                logging.error(f"Ошибка при обработке {archive_path}: {exc}")
+        for future in concurrent.futures.as_completed(future_to_url):
+            url = future_to_url[future]
+            result = future.result()
+            if result is None:
                 continue
-
-            archive_filename = os.path.basename(archive_path)
+            archive_filename, examples = result
             if examples:
                 X = np.stack([ex["features"] for ex in examples])
                 Y = np.array([ex["target"] for ex in examples], dtype=np.float32)
@@ -280,7 +287,7 @@ def main():
                 np.savez_compressed(output_path, X=X, Y=Y)
                 logging.info(f"Сохранён датасет: {output_path} (образцов: {X.shape[0]})")
             else:
-                logging.info(f"Для архива {archive_path} не сформировано обучающих примеров.")
+                logging.info(f"Для архива {archive_filename} не сформировано обучающих примеров.")
 
 if __name__ == "__main__":
     main()
