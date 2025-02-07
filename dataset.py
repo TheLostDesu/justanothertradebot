@@ -198,11 +198,6 @@ def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
                                 })
                                 last_generated_time = time.time()
 
-                        # Если давно не появлялось новое обновление, завершаем обработку
-                        if time.time() - last_generated_time > timeout:
-                            logging.info("Достигнут timeout (30 сек) – возвращаю накопленные примеры.")
-                            return training_examples
-
     except Exception as e:
         logging.error(f"Ошибка при обработке архива {filepath}: {traceback.format_exc()}")
         return training_examples
