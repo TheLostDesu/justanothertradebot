@@ -102,6 +102,7 @@ def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
             – цель: вычисляется как относительное изменение mid‑цены между первым и последним snapshot‑ом.
          После формирования примера окно сдвигается (удаляя первый snapshot).
       4. Если в течение timeout (30 сек) не появляется новый пример, возвращаются накопленные данные.
+      5. Дополнительно: сохраняются данные о свечах (candles), если они есть в features.
     """
     training_examples = []
     last_generated_time = time.time()
@@ -115,6 +116,7 @@ def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
                 bytes_read = 0
                 logged_thresholds = set()
                 logging.info(f"Обработка файла {filename} ({total_size} байт)...")
+
                 with zf.open(filename) as f:
                     for line in f:
                         bytes_read += len(line)
@@ -123,13 +125,17 @@ def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
                             if current_percentage >= threshold and threshold not in logged_thresholds:
                                 logging.info(f"Файл {filename}: обработано {threshold}%")
                                 logged_thresholds.add(threshold)
+
                         try:
                             record = json.loads(line.decode("utf-8").strip())
                         except Exception:
                             continue
+
                         data = record.get("data", {})
                         r_type = record.get("type")
                         ts = record.get("ts")
+
+                        # Преобразуем ts в float, если возможно
                         try:
                             ts = float(ts)
                         except Exception:
@@ -141,6 +147,7 @@ def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
                         # Получаем накопленные фичи (включая sequence и candles)
                         features = ob.get_features()
                         sequence = features.get("sequence", [])
+                        candles = features.get("candles", [])  # <-- достаём свечи
 
                         # Если накоплено достаточно snapshot-ов, формируем обучающий пример
                         if len(sequence) >= SEQUENCE_LENGTH:
@@ -149,25 +156,29 @@ def process_archive_streaming(filepath: str, timeout: float = 30) -> list:
                             last_mid = float(window[-1].get("mid", 0))
                             target_delta = ((last_mid - first_mid) / first_mid) if first_mid != 0 else 0.0
 
-                            # В обучающем примере просто сохраняем список snapshot-ов
+                            # Пример сохраняет список snapshot-ов, данные по свечам и целевое значение
                             training_examples.append({
                                 "features": window,
+                                "candles": candles,  # <-- сохраняем свечи
                                 "target": np.float32(target_delta)
                             })
                             last_generated_time = time.time()
 
-                            # Сдвигаем окно, удаляя первый snapshot, чтобы сформировать новое окно для будущего примера
+                            # Сдвигаем окно, удаляя первый snapshot, чтобы сформировать новое
                             if ob.sequence_history:
                                 ob.sequence_history.popleft()
 
+                        # Если давно не было новых примеров, выходим
                         if time.time() - last_generated_time > timeout:
                             logging.info("Достигнут timeout (30 сек) – возвращаю накопленные примеры.")
                             return training_examples
+
     except Exception as e:
         logging.error(f"Ошибка при обработке архива {filepath}: {traceback.format_exc()}")
         return training_examples
 
     return training_examples
+
 
 def download_and_process(url: str, zips_dir: str, data_dir: str, timeout: float, download: bool) -> str:
     """
