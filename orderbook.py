@@ -98,7 +98,7 @@ class Orderbook:
                         self.current_ob[side].update(price, size)
 
         # Сохраняем snapshot фичи ордербука раз в секунду
-        if self.last_snapshot_time is None or (timestamp - self.last_snapshot_time) >= 1:
+        if self.last_snapshot_time is None or (timestamp - self.last_snapshot_time) >= 1000:
             self.last_snapshot_time = timestamp
             snapshot = self.get_snapshot_features()
             if snapshot:
@@ -107,6 +107,7 @@ class Orderbook:
             mid_price = snapshot.get('mid') if snapshot else None
             if mid_price is not None:
                 self._update_candle(mid_price, timestamp)
+       
 
     def get_snapshot_features(self):
         """
@@ -145,7 +146,7 @@ class Orderbook:
             self.current_candle['close'] = mid_price
 
             # Если прошёл интервал свечи, завершаем её
-            if timestamp - self.current_candle['start'] >= CANDLE_INTERVAL_MIN * 60:
+            if timestamp - self.current_candle['start'] >= CANDLE_INTERVAL_MIN * 60 * 1000:
                 candle = {
                     'open': self.current_candle['open'],
                     'high': self.current_candle['high'],
