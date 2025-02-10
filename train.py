@@ -63,28 +63,38 @@ def custom_loss(predictions: torch.Tensor,
 ############################################
 # 2. Загружаем датасет из NPZ-файла
 ############################################
-def load_dataset(npz_path: str = "data/2024-05-02_BTCUSDT_ob500.data.npz") -> TensorDataset:
+def load_dataset_from_folder(folder_path: str) -> TensorDataset:
     """
-    Ожидается, что в NPZ-файле содержатся массивы:
+    Загружает все .npz файлы из папки и объединяет их в один датасет.
+    Ожидается, что каждый NPZ-файл содержит массивы:
       - "X": numpy-массив с признаками размерности [N, SEQUENCE_LENGTH, SNAPSHOT_SIZE]
       - "Y": numpy-массив с целевыми значениями размерности [N] или [N, 1]
     """
-    data = np.load(npz_path, allow_pickle=True)
-    # Преобразуем признаки в новый формат
-    features = np.array(process_input(data["X"]), dtype=np.float32)
+    features_list = []
+    targets_list = []
+
+    for file_name in os.listdir(folder_path):
+        if file_name.endswith('.npz'):
+            file_path = os.path.join(folder_path, file_name)
+            data = np.load(file_path, allow_pickle=True)
+            
+            # Преобразуем признаки в новый формат
+            features = np.array(process_input(data["X"]), dtype=np.float32)
+            targets = np.array(data["Y"], dtype=np.float32)
+            if targets.ndim == 2 and targets.shape[1] == 1:
+                targets = targets.squeeze(axis=1)
+            
+            features_list.append(features)
+            targets_list.append(targets)
+
+    # Объединяем все данные в одну большую матрицу
+    features_all = np.concatenate(features_list, axis=0)
+    targets_all = np.concatenate(targets_list, axis=0)
     
-    # Проверяем размерность данных
-    # actual_seq_length = features.shape[1]
-    # if actual_seq_length != SEQUENCE_LENGTH:
-    #     raise ValueError(f"Размерность последовательности в датасете ({actual_seq_length}) не совпадает с SEQUENCE_LENGTH ({SEQUENCE_LENGTH}).")
-    
-    # Обрабатываем целевые значения (Y)
-    targets = np.array(data["Y"], dtype=np.float32)
-    if targets.ndim == 2 and targets.shape[1] == 1:
-        targets = targets.squeeze(axis=1)
-    
+    # print(features_all[0], targets_all[0])  # Можно удалить, если не нужно
+
     # Создаём TensorDataset для обучения
-    dataset = TensorDataset(torch.from_numpy(features), torch.from_numpy(targets))
+    dataset = TensorDataset(torch.from_numpy(features_all), torch.from_numpy(targets_all))
     return dataset
 
 
@@ -96,8 +106,11 @@ def objective(trial: optuna.trial.Trial,
               val_dataset: TensorDataset,
               device: torch.device) -> float:
     # Сначала выбираем nhead, затем model_dim так, чтобы model_dim был кратен nhead.
-    nhead = trial.suggest_int("nhead", 2, 8)
-    model_dim = trial.suggest_int("model_dim", nhead, 256, step=nhead)
+    nhead = trial.suggest_int("nhead", 4, 8, step=4)
+    model_dim = trial.suggest_int("model_dim", nhead * 2, 256, step=nhead)
+    print(nhead, model_dim)
+    # nhead = trial.suggest_int("nhead", 2, 8)
+    # model_dim = trial.suggest_int("model_dim", nhead, 256, step=nhead)
     num_layers = trial.suggest_int("num_layers", 2, 4)
     dropout = trial.suggest_float("dropout", 0.0, 0.5)
     learning_rate = trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True)
@@ -115,11 +128,11 @@ def objective(trial: optuna.trial.Trial,
     val_loader = DataLoader(val_dataset, batch_size=TRAIN_BATCH_SIZE, shuffle=False)
     
     for epoch in range(TRAIN_NUM_EPOCHS):
-        print(f'Эпоха {epoch} оптимайза пошла')
+        # print(f'Эпоха {epoch} оптимайза пошла')
         model.train()
-        print(f'Трейн {epoch} оптимайза закончился')
+        # print(f'Трейн {epoch} оптимайза закончился')
         train_loss_accum = 0.0
-        c = 0
+        # c = 0
         for X_batch, y_batch in train_loader:
             X_batch = X_batch.to(device)
             y_batch = y_batch.to(device)
@@ -129,8 +142,8 @@ def objective(trial: optuna.trial.Trial,
             loss.backward()
             optimizer.step()
             train_loss_accum += loss.item() * X_batch.size(0)
-            print(c)
-            c += 1
+            # print(c)
+            # c += 1
         train_loss = train_loss_accum / len(train_dataset)
         print(f'eval {epoch}')
         model.eval()
@@ -158,13 +171,13 @@ if __name__ == '__main__':
     torch.cuda.empty_cache()
     print("Using device:", device)
     
-    full_dataset = load_dataset("data/2024-05-02_BTCUSDT_ob500.data.npz")
+    full_dataset = load_dataset_from_folder("./data")
     n_total = len(full_dataset)
     n_train = int(n_total * 0.8)
     n_val = n_total - n_train
     from torch.utils.data import random_split
     train_dataset, val_dataset = random_split(full_dataset, [n_train, n_val])
-    print('Живой я !')
+    print('Живой я!')
     study = optuna.create_study(direction="minimize")
     study.optimize(lambda trial: objective(trial, train_dataset, val_dataset, device),
                    n_trials=20)
@@ -176,7 +189,7 @@ if __name__ == '__main__':
     
     print("\nRetraining on full dataset with best parameters...")
     best_params = best_trial.params
-    
+    np.savez("./params/best_barams.npz", best_params)
     model = CombinedModel(
         input_dim=TOTAL_INPUT_DIM,
         model_dim=best_params["model_dim"],
